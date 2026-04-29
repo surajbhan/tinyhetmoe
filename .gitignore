@@ -8,9 +8,12 @@ logs/
 data/train.bin
 data/val.bin
 
-# Trained model weights — pushed separately as a release artifact once
-# v2 finishes. Do NOT commit until then. (`tiny.meta.json` is fine,
-# it's just a few hundred bytes of metadata.)
+# Trained model weights — committed to docs/tiny.bin once v2 finishes
+# (so GitHub Pages serves it directly). Until then, gitignore so we
+# don't accidentally check in the in-flight v1 weights.
+docs/tiny.bin
+docs/tiny_v2.bin
+# Old path (pre-rename to docs/) — keep for safety
 ui/tiny.bin
 ui/tiny_v2.bin
 

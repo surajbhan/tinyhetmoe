@@ -34,18 +34,22 @@ attention.
 ## Try it
 
 ```bash
+## Live demo
+
+**[surajbhan.github.io/tinyhetmoe](https://surajbhan.github.io/tinyhetmoe/)**
+
+Or run locally:
+
+```bash
 git clone https://github.com/surajbhan/tinyhetmoe
-cd tinyhetmoe
-# Download the model weights (separate from the repo)
-curl -L -o ui/tiny.bin <release URL — coming after v2 finishes>
-# Serve the UI
-cd ui && python3 -m http.server 8765
+cd tinyhetmoe/docs && python3 -m http.server 8765
 # Open http://localhost:8765
 ```
 
-The model file (`tiny.bin`, ~42 MB) is published as a release artifact,
-not committed in the repo. Once downloaded, the entire experience runs
-client-side — no backend, no API call, no telemetry.
+The repo's `docs/` folder is what GitHub Pages serves. The model file
+`docs/tiny.bin` (~42 MB) is committed alongside the rest of the UI so
+the page works out of the box. The entire experience runs client-side —
+no backend, no API, no telemetry.
 
 ## How it's organized
 
@@ -73,7 +77,7 @@ tinyhetmoe/
 │   ├── src/wasm_api.rs     (wasm-bindgen JS interface)
 │   └── src/bin/            (native test harnesses)
 │
-├── ui/                     ← static dashboard, GitHub Pages target
+├── docs/                     ← static dashboard, GitHub Pages target
 │   ├── index.html, style.css, app.js
 │   ├── wasm-pkg/           (compiled WASM + JS bindings)
 │   ├── encode_lookup.json  (GPT-2 BPE → tiny vocab remap, JS-side)
@@ -102,7 +106,7 @@ torchrun --nproc_per_node=2 training/train_tiny_hetmoe.py \
 # 4. Export to ternary binary
 python3 scripts/export_model.py \
   --ckpt runs/tiny_hetmoe_v2/checkpoints/best.pt \
-  --out ui/tiny.bin
+  --out docs/tiny.bin   # served by GitHub Pages
 ```
 
 ## Building the inference engine
@@ -114,7 +118,7 @@ cargo build --release
 ./target/release/tiny_hetmoe_native ../runs/tiny_hetmoe_v2/checkpoints/best.pt
 # WASM (for the browser)
 cargo build --release --target wasm32-unknown-unknown --features wasm
-wasm-bindgen --target web --out-dir ../ui/wasm-pkg \
+wasm-bindgen --target web --out-dir ../docs/wasm-pkg \
   target/wasm32-unknown-unknown/release/tiny_hetmoe_wasm.wasm
 ```
 

@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#1a1612" />
+  <title>TinyHetMoE — explainable ternary LM</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-left">
+      <h1>TinyHetMoE<span class="logo-dot">.</span></h1>
+      <span class="subtitle">
+        A 38M-parameter <b>ternary</b> language model that runs entirely in your browser.
+        Built around a 132-axis <b>named meaning embedding</b> &mdash; so every prediction can be
+        explained, not just measured. Designed for <b>infinite context</b> via meaning-protected
+        attention. Click tokens to inspect; click candidates to extend.
+      </span>
+    </div>
+    <div class="topbar-right">
+      <span class="meta-chip" id="meta">Loading…</span>
+      <span class="meta-chip">step <b id="ckpt-step">…</b></span>
+      <span class="meta-chip">val <b id="ckpt-val">…</b> · PPL <b id="ckpt-ppl">…</b></span>
+      <span class="meta-chip">QAT <b id="qat-status">…</b></span>
+      <span class="meta-chip" id="tps-chip">⚡ <b id="tps-val">—</b> tok/s</span>
+    </div>
+  </header>
+
+  <main class="grid">
+    <!-- LEFT COLUMN: story + auto controls -->
+    <section id="story-section" class="card story-card">
+      <div class="card-head">
+        <h2>Your story</h2>
+        <div class="controls">
+          <input type="text" id="prompt-input" value="Once upon a time, there was a happy little" />
+          <button id="run-btn" title="Reset and run prompt from scratch">Run</button>
+          <button id="reset-btn" title="Reset story to just the prompt">Reset</button>
+          <button id="step-btn" title="Take one auto-pick step">+1</button>
+          <button id="auto-btn" title="Auto-complete N tokens">Auto+50</button>
+        </div>
+        <div class="sampler-controls">
+          <label class="sc-item" title="Greedy = always pick top-1. Sampling = roll the dice based on temperature.">
+            <span>mode</span>
+            <select id="strategy">
+              <option value="greedy">greedy</option>
+              <option value="sample" selected>sample</option>
+            </select>
+          </label>
+          <label class="sc-item" title="Temperature: lower = more confident/repetitive, higher = more creative/wild.">
+            <span>temp</span>
+            <input type="range" id="cfg-temp" min="0.1" max="1.5" step="0.05" value="0.8" />
+            <span class="sc-val" id="cfg-temp-val">0.80</span>
+          </label>
+          <label class="sc-item" title="Top-K: only consider this many highest-probability tokens for sampling.">
+            <span>top-K</span>
+            <input type="range" id="cfg-topk" min="1" max="200" step="1" value="50" />
+            <span class="sc-val" id="cfg-topk-val">50</span>
+          </label>
+          <label class="sc-item" title="Repetition penalty: tokens used recently get their score divided by this. 1.0 = off.">
+            <span>rep</span>
+            <input type="range" id="cfg-rep" min="1.0" max="2.5" step="0.05" value="1.6" />
+            <span class="sc-val" id="cfg-rep-val">1.60</span>
+          </label>
+          <label class="sc-item" title="Window of recent tokens to apply repetition penalty over.">
+            <span>win</span>
+            <input type="range" id="cfg-win" min="0" max="80" step="1" value="32" />
+            <span class="sc-val" id="cfg-win-val">32</span>
+          </label>
+          <label class="sc-item" title="How many tokens Auto-complete generates per click.">
+            <span>auto-n</span>
+            <input type="range" id="cfg-autoN" min="1" max="100" step="1" value="50" />
+            <span class="sc-val" id="cfg-autoN-val">50</span>
+          </label>
+        </div>
+      </div>
+      <div id="story"></div>
+      <p class="card-foot-hint">
+        <span class="tok-prompt-legend">prompt</span>
+        <span class="tok-gen-legend">generated</span>
+        Click any token to inspect.
+      </p>
+    </section>
+
+    <!-- MIDDLE COLUMN: explain -->
+    <section id="explain-section" class="card explain-card">
+      <div class="card-head">
+        <h2>What the model sees · <span id="topk-pos" class="inline-pos">…</span></h2>
+      </div>
+      <div id="explain"></div>
+    </section>
+
+    <!-- RIGHT COLUMN: top-K -->
+    <section id="topk-section" class="card topk-card">
+      <div class="card-head">
+        <h2>Pick what comes next</h2>
+      </div>
+      <div id="topk"></div>
+    </section>
+
+    <!-- BOTTOM ROW: meaning axes -->
+    <section id="meaning-section" class="card meaning-card">
+      <div class="card-head">
+        <h2>Meaning axes (top 18 of 132)</h2>
+      </div>
+      <div id="meaning"></div>
+    </section>
+
+    <!-- BOTTOM RIGHT: attention -->
+    <section id="attn-section" class="card attn-card">
+      <div class="card-head">
+        <h2>Attention · 4L × 4H</h2>
+      </div>
+      <div class="attn-route-grid">
+        <div id="attn"></div>
+        <div class="route-inset">
+          <div class="route-inset-head">HetMoE routing</div>
+          <div id="route"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

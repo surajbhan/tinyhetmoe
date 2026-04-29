@@ -1,0 +1,133 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>TinyHetMoE smoke test</title>
+  <style>
+    body { font-family: monospace; padding: 20px; max-width: 800px; }
+    pre { background: #f0f0f0; padding: 12px; border-radius: 4px; white-space: pre-wrap; }
+    .gen { color: #2466b8; font-weight: bold; }
+    button { padding: 8px 16px; font-size: 14px; margin-right: 8px; }
+    #status { color: #888; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>TinyHetMoE — WASM smoke test</h1>
+  <div id="status">Loading…</div>
+  <p>
+    <button id="gen10">Generate 10 tokens</button>
+    <button id="gen30">Generate 30 tokens</button>
+    <button id="reset">Reset</button>
+  </p>
+  <pre id="story"></pre>
+  <p id="stats"></p>
+
+  <script type="module">
+    import init, { WasmModel } from "./wasm-pkg/tiny_hetmoe_wasm.js";
+
+    const PROMPT_IDS = [1, 59, 63, 10, 40, 7, 42, 11, 10, 43, 41];  // <bos> Once upon a time, there was a happy little
+    const PROMPT_LEN = PROMPT_IDS.length;
+
+    let model = null;
+    let decode = null;
+    let history = [...PROMPT_IDS];
+
+    const statusEl = document.getElementById("status");
+    const storyEl = document.getElementById("story");
+    const statsEl = document.getElementById("stats");
+
+    async function boot() {
+      statusEl.textContent = "Initializing WASM…";
+      await init();
+      statusEl.textContent = "Loading vocabulary…";
+      decode = await fetch("decode_lookup.json").then(r => r.json());
+      statusEl.textContent = "Loading model weights (42 MB)…";
+      const bytes = new Uint8Array(await (await fetch("tiny.bin")).arrayBuffer());
+      statusEl.textContent = "Building model in WASM…";
+      const t0 = performance.now();
+      model = new WasmModel(bytes);
+      const tLoad = performance.now() - t0;
+      statusEl.textContent = `Model ready (load+pack ${tLoad.toFixed(0)} ms). ${model.vocab_size} vocab, ${model.num_layers} layers × ${model.num_heads} heads, ${model.num_experts} experts.`;
+      runPrompt();
+    }
+
+    function runPrompt() {
+      model.reset();
+      history = [...PROMPT_IDS];
+      for (const tid of PROMPT_IDS) {
+        model.step(tid);
+      }
+      render();
+    }
+
+    function generateN(n) {
+      const t0 = performance.now();
+      // Get last logits via stepping the most recently produced token
+      // (we already stepped through history; we take the last step's logits)
+      // For simplicity: greedy-ish — re-compute by stepping the last token
+      // again would advance KV further. Instead, call step() on each new
+      // token we sample from the previous step's logits.
+
+      // Capture logits from the last history token by stepping it once.
+      // Wait: history.last was already stepped during runPrompt. The step()
+      // call returns the logits AT that position (predicting what comes
+      // AFTER this token). So the last step()'s logits give us next-token
+      // distribution.
+
+      // We need to keep a reference to the last step. Re-run: easier to
+      // just track last_logits.
+      let lastStep = null;
+      // We've already stepped history. To get logits we need to re-step
+      // the LAST token (with KV reset & re-fed). That's wasteful but
+      // simple. Better: refactor to keep last_logits cached. For now:
+      model.reset();
+      for (const tid of history) {
+        lastStep = model.step(tid);
+      }
+
+      // Now sample N more tokens
+      for (let k = 0; k < n; k++) {
+        const logits = lastStep.logits;
+        // Greedy + small temperature: top-3 weighted random
+        const idxs = Array.from(logits.keys());
+        idxs.sort((a, b) => logits[b] - logits[a]);
+        const top = idxs.slice(0, 5);
+        const T = 0.8;
+        const max = Math.max(...top.map(i => logits[i]));
+        const exps = top.map(i => Math.exp((logits[i] - max) / T));
+        const sum = exps.reduce((a, b) => a + b, 0);
+        const r = Math.random() * sum;
+        let acc = 0;
+        let pick = top[0];
+        for (let i = 0; i < top.length; i++) {
+          acc += exps[i];
+          if (r < acc) { pick = top[i]; break; }
+        }
+        history.push(pick);
+        lastStep = model.step(pick);
+      }
+      const dt = performance.now() - t0;
+      const tps = (history.length) / (dt / 1000);
+      statsEl.textContent = `Generated ${n} tokens in ${dt.toFixed(0)} ms (full re-run: ${history.length} tokens, ${tps.toFixed(1)} tok/s avg over re-run)`;
+      render();
+    }
+
+    function render() {
+      storyEl.innerHTML = "";
+      history.forEach((tid, i) => {
+        const span = document.createElement("span");
+        const s = decode[String(tid)] || `<${tid}>`;
+        span.textContent = s;
+        if (i >= PROMPT_LEN) span.className = "gen";
+        storyEl.appendChild(span);
+      });
+    }
+
+    document.getElementById("gen10").addEventListener("click", () => generateN(10));
+    document.getElementById("gen30").addEventListener("click", () => generateN(30));
+    document.getElementById("reset").addEventListener("click", runPrompt);
+
+    boot();
+  </script>
+</body>
+</html>

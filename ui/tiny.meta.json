@@ -1,0 +1,54 @@
+{
+  "format": "HTMOE002",
+  "training_step": 23000,
+  "best_val": 3.051220889091492,
+  "config": {
+    "vocab_size": 5967,
+    "meaning_dim": 132,
+    "intuition_dim": 132,
+    "input_dim": 264,
+    "internal_dim": 528,
+    "new_intuition": 264,
+    "num_layers": 4,
+    "num_heads": 4,
+    "head_dim": 132,
+    "max_seq_len": 512,
+    "num_experts": 4,
+    "top_k_experts": 2,
+    "ffn_mult": 2.0
+  },
+  "expert_archs": [
+    [
+      0,
+      1,
+      2,
+      3
+    ],
+    [
+      0,
+      1,
+      2,
+      3
+    ],
+    [
+      0,
+      1,
+      2,
+      3
+    ],
+    [
+      0,
+      1,
+      2,
+      3
+    ]
+  ],
+  "expert_arch_names": [
+    "Standard",
+    "SwiGLU",
+    "DeepNarrow",
+    "Bottleneck"
+  ],
+  "ternary_params": 36231624,
+  "sparsity_zeros_frac": 0.4758911717564744
+}

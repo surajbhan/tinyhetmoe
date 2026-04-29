@@ -1,0 +1,35 @@
+[package]
+name = "tiny_hetmoe_wasm"
+version = "0.1.0"
+edition = "2021"
+description = "TinyHetMoE ternary inference engine — native Rust + WASM target"
+
+[lib]
+name = "tiny_hetmoe_wasm"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "tiny_hetmoe_native"
+path = "src/main.rs"
+
+[dependencies]
+byteorder = "1.5"
+
+# wasm-bindgen path is opt-in. To build native, just `cargo build --release`.
+# To build WASM, `cargo build --release --target wasm32-unknown-unknown --features wasm`.
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
+
+[features]
+default = []
+wasm = ["dep:wasm-bindgen", "dep:js-sys"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.release.package."*"]
+opt-level = 3

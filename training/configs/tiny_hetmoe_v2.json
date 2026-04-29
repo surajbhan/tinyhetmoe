@@ -1,0 +1,52 @@
+{
+  "run_name": "tiny_hetmoe_v2_bf16_then_qat",
+  "out_dir": "runs/tiny_hetmoe_v2",
+  "resume_from": "",
+
+  "vocab_size": 5967,
+  "meaning_dim": 132,
+  "intuition_dim": 132,
+  "input_dim": 264,
+  "internal_dim": 528,
+  "new_intuition": 264,
+  "num_layers": 4,
+  "num_heads": 4,
+  "num_experts": 4,
+  "top_k_experts": 2,
+  "ffn_mult": 2.0,
+  "max_seq_len": 512,
+  "load_balance_weight": 0.01,
+
+  "train_file": "data/train.bin",
+  "val_file": "data/val.bin",
+  "meaning_emb_path": "data/meaning_axes_132.npy",
+
+  "seq_len": 512,
+  "micro_batch": 16,
+  "grad_accum": 2,
+  "max_steps": 60000,
+  "warmup_steps": 1000,
+  "lr": 0.0003,
+  "min_lr": 3e-05,
+  "weight_decay": 0.01,
+  "max_grad_norm": 1.0,
+
+  "log_interval": 20,
+  "val_interval": 500,
+  "save_interval": 2000,
+  "val_seqs": 50,
+  "keep_recent_ckpts": 3,
+  "seed": 1337,
+  "dtype": "bf16",
+
+  "lr_plateau_patience": 8,
+  "lr_floor": 1e-05,
+  "lr_decay_factor": 0.5,
+
+  "freeze_meaning": false,
+
+  "qat_from_zero": false,
+  "qat_start_step": 48000,
+
+  "gpu_resident_corpus": true
+}

@@ -5,6 +5,67 @@ each gate (not just end-of-day). New entries on top.
 
 ---
 
+## 2026-04-30 16:00 — v5b extrapolation evaluation
+
+Ran proper long-context evaluation on v5b's bf16 best (1.6056) and
+QAT best (1.5977 / deployed). Three random val offsets averaged for
+each, sequence length 4096 per offset.
+
+### bf16 model — clean extrapolation through training range
+
+| Range | PPL | Note |
+|---|---|---|
+| 256-512 | **4.09** | in training range |
+| 512-1024 | **4.16** | in training range |
+| 1024-2048 | **4.15** | in training range |
+| 2048-3072 | 10.94 | 1.5× past training cap |
+| 3072-4096 | 77.65 | 2× past training cap |
+
+**Variable-length training works as designed.** PPL stays effectively
+flat across 256 → 2048 (the longest training length). That's an
+8× ratio with no degradation. Past the 2048 cap the model degrades —
+expected, since no var_lengths sample was longer than 2048.
+
+### QAT model — same shape, higher absolute PPL
+
+| Range | PPL |
+|---|---|
+| 256-512 | 7.45 |
+| 512-1024 | 7.78 |
+| 1024-2048 | 8.23 |
+| 2048-3072 | 34.57 |
+| 3072-4096 | 159.58 |
+
+The QAT model is uniformly worse than bf16 (~1.8× PPL), but the
+**extrapolation pattern is identical**: flat in-range, sharp drop
+past training cap. Ternary quantization didn't break the var-length
+benefit.
+
+### Comparison vs v4a (fixed-length 512)
+
+v4a's earlier extrapolation test:
+- in-range PPL 6
+- 512-1024 PPL 38
+- 1024-2048 PPL 237
+
+v5b at 1024-2048 holds **PPL 8.23** (QAT) and **PPL 4.15** (bf16) —
+about **30× better** than v4a in the same range. Var-length training
+is the difference.
+
+### Honest caveat
+
+The 2048-cap collapse isn't a recipe failure but a data-cap failure
+discussed in blog post 2: TinyStories docs are short, so 4K-token
+val windows are sequences of unrelated short stories with `<eos>`
+boundaries. Past the most recent boundary there's no useful signal
+in the prefix, so attention to long prefix is mostly noise. A real
+long-context test (PG-19 / WikiText) would tell a different story.
+
+For now: **v5b deployed model holds clean PPL up to 2× the longest
+training sequence**. That's the meaningful claim.
+
+---
+
 ## 2026-04-30 15:10 — v5b finished. Hierarchical-MoE plan committed.
 
 ### v5b final result

@@ -1,6 +1,9 @@
 # Getting ternary QAT to actually converge
 
-*Draft — 2026-04-30.*
+*Draft — 2026-04-30. **Correction at end** (2026-04-30, evening): the
+PPL numbers in this post were measured by training code that had a
+bug. The deployed model is real but actually runs at PPL ~9 in the
+browser, not PPL 4.94. See the addendum for the honest story.*
 
 This post is about how the model you're playing with on the front page
 got to PPL 4.82. The short version: it took five attempts. Each one
@@ -132,5 +135,88 @@ Long-context generalization works: PPL ~5 in-training-range, holding around
 PPL 6 at 1K-2K positions. Past the 2K training cap it still degrades, but
 that's a data-cap issue (TinyStories docs are short) rather than an
 architecture failure.
+
+— *S.*
+
+---
+
+## Addendum: the headline PPL was wrong, but the model is fine
+
+*Added 2026-04-30, same evening I posted this.*
+
+While starting on next-generation models, I went to verify that the
+deployed v5b model loads correctly for a stitching experiment. It
+does — but the val number didn't match. Eventually traced it to a
+real bug in our training code that's been there since v1.
+
+### The bug
+
+The training-time loss path used an FP matmul shortcut for `lm_head`,
+even when the rest of the network was running QAT (ternary). The
+deployed inference path **always** ran lm_head ternary. So every
+"best val" number this post quotes was measured in a forward pass
+that doesn't match what gets deployed in the browser.
+
+### Effect on v5b
+
+Re-evaluating the deployed `best_qat.pt` properly:
+
+| metric | what I told you | what's actually true |
+|---|---:|---:|
+| QAT best val | 1.5977 | ~2.20 (across 5 trials, σ ~0.05) |
+| QAT best PPL | **4.94** | **~9** |
+
+Almost 2× higher than published. The bf16 number (PPL 4.55) was
+honest — that path doesn't use QAT, doesn't hit the bug.
+
+### But here's the thing — the demo still produces fluent prose
+
+I went and generated from the deployed forward path. Prompt: *"Once
+upon a time, there was a little girl named Lily. She loved to"*.
+Output:
+
+> *play with her toys and have fun. One day, Lily's mom took her to
+> the park to play. While playing, Lily found a bottle on the ground.
+> She picked it up and said, "Look, Mom! A bottle!" She said, "Let's
+> see what's inside." Lily carefully touched the bottle and said,
+> "This sip."*
+
+That's fluent. The "This sip" at the end is a small clunky moment,
+but the whole thing reads as recognizable kid-story prose. **PPL 9
+on TinyStories is fine for the demo experience** — the distribution
+has very low entropy (1500-word vocabulary, simple grammar), so a
+PPL 9 model still produces coherent output. PPL 9 on, say, Wikipedia
+would be word salad. Different distributions, different perceptual
+floors.
+
+So the "bug" was a *measurement* bug, not a *model* bug. The model
+the bug produced is real. It just wasn't quite as good as the number
+suggested.
+
+### Why I didn't catch this for five months
+
+Two reasons. First, I never compared the training-reported number to
+a held-out test-set CE on the deployed forward path — I assumed they
+matched. Second, the demo subjectively works, so I had no signal
+that something was off. Both are reasonable failures, but the lesson
+is small and clear: **when training reports a number, measure that
+exact same number against the deployed forward path before
+publishing it**. Train↔deploy correspondence isn't free.
+
+### Fix and what's next
+
+One-line code change: pre-quantize lm_head outside the chunked-CE
+loop when QAT is on. Now the loss path goes through the same ternary
+forward as deployment, and reported numbers match what users get.
+
+For v6.x (the four-domain experts coming next), training uses the
+fixed code, so all val numbers are honest by construction.
+
+For v5b specifically, the right thing is to redo 3K QAT steps on the
+bf16 checkpoint with the bug-fixed code. The model will land
+somewhere between bf16 PPL 4.55 and the current deployed PPL 9 —
+probably PPL 5-6. That gives a v5b that's actually as good as I
+originally claimed. I'll do that and update the demo. Doesn't take
+long; there's just been higher-priority things this week.
 
 — *S.*

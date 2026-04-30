@@ -404,12 +404,25 @@ class TinyHetMoE(nn.Module):
     def load_meaning_embeddings(self, path: str, freeze: bool = False):
         """Load (vocab_size, meaning_dim) contextual axis embeddings from
         a .npy file. If `freeze=True`, sets requires_grad=False (A recipe).
-        For B recipe (default), keeps trainable."""
+        For B recipe (default), keeps trainable.
+
+        Tolerant of axes files larger than the model's vocab_size — takes
+        the first vocab_size rows. Lets us share one axes file across
+        multiple configs (e.g. vocab=32768 v6.5 runs alongside vocab=32772
+        v6.6+ runs after the ChatML vocab grow)."""
         emb = np.load(path)
-        assert emb.shape == (self.cfg.vocab_size, self.cfg.meaning_dim), (
-            f"meaning embedding shape {emb.shape} does not match config "
-            f"({self.cfg.vocab_size}, {self.cfg.meaning_dim})"
-        )
+        if emb.shape[1] != self.cfg.meaning_dim:
+            raise AssertionError(
+                f"meaning embedding meaning_dim {emb.shape[1]} does not "
+                f"match config meaning_dim {self.cfg.meaning_dim}")
+        if emb.shape[0] < self.cfg.vocab_size:
+            raise AssertionError(
+                f"meaning embedding has {emb.shape[0]} rows but config "
+                f"requires vocab_size {self.cfg.vocab_size}")
+        if emb.shape[0] > self.cfg.vocab_size:
+            print(f"[load_meaning] axes file has {emb.shape[0]} rows, "
+                  f"taking first {self.cfg.vocab_size}")
+            emb = emb[: self.cfg.vocab_size]
         with torch.no_grad():
             self.meaning_embed.weight.copy_(torch.from_numpy(emb).float())
         self.meaning_embed.weight.requires_grad = not freeze
@@ -453,7 +466,18 @@ class TinyHetMoE(nn.Module):
         if targets is None:
             return self.lm_head(hidden), None
 
-        # Chunked CE for memory efficiency
+        # Chunked CE for memory efficiency. We pre-quantize lm_head ONCE
+        # outside the chunk loop (when QAT is on) so the loss path matches
+        # what QuantizedLinear would do — but without the per-chunk
+        # quantization overhead. Critical: this matmul MUST go through
+        # the ternary path during QAT, otherwise lm_head trains as FP and
+        # the deployed ternary export has no learned signal for it.
+        # (Pre-fix the loss path bypassed QAT and ternary lm_head was a
+        # quality cliff at deployment time.)
+        if self.lm_head.quantize:
+            w_lm = ternary_quantize(self.lm_head.weight)
+        else:
+            w_lm = self.lm_head.weight
         h_flat = hidden.view(-1, hidden.size(-1))
         t_flat = targets.view(-1)
         CHUNK = 1024
@@ -462,7 +486,7 @@ class TinyHetMoE(nn.Module):
         for i in range(0, h_flat.shape[0], CHUNK):
             h = h_flat[i:i + CHUNK]
             t = t_flat[i:i + CHUNK]
-            logits = h @ self.lm_head.weight.t()  # FP — no QAT on this matmul
+            logits = h @ w_lm.t()
             total = total + F.cross_entropy(logits, t, reduction="sum")
             count += t.shape[0]
         return None, total / count + aux_total

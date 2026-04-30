@@ -5,6 +5,90 @@ each gate (not just end-of-day). New entries on top.
 
 ---
 
+## 2026-04-30 23:00 — Found and fixed a long-standing measurement bug (v5b numbers were wrong)
+
+While debugging vocab padding for the v6.5 → v6.6 rebuild, hit a model
+mismatch that exposed a real bug we've been carrying since v1: the
+training-loop's loss path was computing CE through an FP shortcut for
+`lm_head`, even when the rest of the network was running QAT
+(ternary). The deployed inference path (and the exported tiny.bin in
+the browser) **always** ran lm_head ternary. So the published "best
+val" numbers on every QAT-trained model were measured in a forward
+pass that doesn't match what gets deployed.
+
+### The bug
+
+`tiny_hetmoe.py:465` did:
+
+```python
+logits = h @ self.lm_head.weight.t()  # FP — no QAT on this matmul
+```
+
+…instead of going through `QuantizedLinear.forward(self.lm_head, h)`
+which would apply `ternary_quantize` when `quantize=True`. The comment
+said it was deliberate (probably for memory in the chunked-CE loop),
+but it broke the train↔deploy correspondence.
+
+### Effect on v5b — the published model
+
+Re-evaluated `runs/tiny_hetmoe_v5b/checkpoints/best_qat.pt` properly
+(`scripts/verify_v5b_deployed.py`):
+
+| metric                       | published    | measured   | gap |
+|------------------------------|-------------:|-----------:|----:|
+| bf16 best.pt (val)           | 1.6056       | **1.5485** | sample noise |
+| bf16 best.pt (PPL)           | 4.98         | **4.70**   | -- |
+| **QAT best_qat.pt (val, deployed)**  | 1.5977       | **2.1873** | **+0.59 nats** |
+| **QAT best_qat.pt (PPL, deployed)**  | **4.94**     | **8.91**   | **1.80×** |
+
+The bf16 number was honest (no QAT, no bug). The QAT number — which
+is what `docs/tiny.bin` actually delivers in the browser — is real
+PPL ~9, not 4.94. The blog post and journal entries that say "PPL
+4.94 deployed" are wrong.
+
+### Affects every TinyHetMoE QAT model we've trained
+
+v1–v5b all had this bug. v5b is the only one currently deployed
+(`docs/tiny.bin`), so it's the only one with a public correction
+needed. Future runs (v6.6+) use the fixed model code and will report
+numbers that match deployment.
+
+### The fix
+
+Pre-quantize lm_head once outside the chunked-CE loop when QAT is on:
+
+```python
+if self.lm_head.quantize:
+    w_lm = ternary_quantize(self.lm_head.weight)
+else:
+    w_lm = self.lm_head.weight
+# ... loop computes logits = h @ w_lm.t()
+```
+
+This goes through the custom `TernaryQuantize` autograd function, so
+STE backward is preserved. Memory cost is one extra (vocab,
+input_dim) matrix during the forward — fits comfortably.
+
+### Side effects to manage
+
+  - `load_meaning_embeddings` made tolerant of larger axes files (take
+    first vocab_size rows). Lets one axes file serve both old vocab=32768
+    runs (v6.5) and new vocab=32772 runs (v6.6+).
+  - QuantizedLinear.quantize is a Python attr, not a parameter →
+    `load_state_dict` doesn't restore it. Eval/inference code needs
+    explicit `set_quantize_mode(model, on=True)` for QAT checkpoints.
+    Same applies to the Rust engine's per-expert QAT flag.
+
+### Next: v6.6 fires the fix
+
+Resuming pg19 + wiki from v6.5 `best.pt` with `--skip-optimizer`,
+`qat_start_step=1`, `max_steps=30000` (3K QAT steps with the fixed
+lm_head). First post-flip val is much higher than v6.5's was —
+expected, since now lm_head also has to recover, not just the rest
+of the network. Whether 3K is enough TBD.
+
+---
+
 ## 2026-04-30 22:20 — v6.5 batch 1 done (pg19 + wiki, 1 GB, bf16 → QAT)
 
 Both runs completed 30 K steps cleanly. QAT enabled at step 27 000

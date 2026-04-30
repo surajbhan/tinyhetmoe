@@ -48,6 +48,18 @@
         date: "2026-04-30",
         summary: "Five tries, three independent bugs. STE vs vote-backward, min_lr floor, variable-length training."
       },
+      {
+        slug: "2-variable-length-and-long-context",
+        title: "Variable-length training and what \"long context\" actually means",
+        date: "2026-04-30",
+        summary: "NoPE doesn't give you infinite context for free. The transformer learns position from attention statistics. Var-length training is the actual fix — and where the data caps you."
+      },
+      {
+        slug: "3-restart-helps-convergence",
+        title: "The trick where you turn it off and on again",
+        date: "2026-04-30",
+        summary: "When training plateaus, restarting from best.pt with fresh Adam state often un-sticks it. Cleanish A/B experiment on v5 → v5b, plus four candidate mechanisms."
+      },
     ];
     initBlog(POSTS);
   </script>

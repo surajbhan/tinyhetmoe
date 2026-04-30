@@ -126,9 +126,11 @@ that all had to be fixed:
    architecture that claims "long context" via position-free
    attention.
 
-The model in your browser is still the run-4 (v4a) model — PPL
-4.82, fixed length 512. As of writing, v5 (var-length) is mid-training
-and will replace it once converged. The trajectory looks promising:
-v5 step 5K already extrapolates 23× better than v4a's final.
+The model in your browser today is the v5b model — PPL 4.94, variable-length
+training, ternary essentially matching the bf16 floor (which was PPL 4.55).
+Long-context generalization works: PPL ~5 in-training-range, holding around
+PPL 6 at 1K-2K positions. Past the 2K training cap it still degrades, but
+that's a data-cap issue (TinyStories docs are short) rather than an
+architecture failure.
 
 — *S.*

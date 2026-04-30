@@ -5,6 +5,99 @@ each gate (not just end-of-day). New entries on top.
 
 ---
 
+## 2026-04-30 15:10 — v5b finished. Hierarchical-MoE plan committed.
+
+### v5b final result
+
+**QAT best: val 1.5977 / PPL 4.94 at step 27500.** Pushed to docs/tiny.bin (live at https://surajbhan.github.io/tinyhetmoe/).
+
+Trajectory across all the runs we've done:
+
+| Run | Recipe | bf16 best | QAT best | Notes |
+|---|---|---|---|---|
+| v1 | QAT-from-zero, vote-backward | n/a | val 3.05 / PPL 21 | wrong gradient + low min_lr |
+| v2 | bf16-then-QAT, low min_lr | 1.54 / 4.67 | 2.55 / 12.7 | LR starved QAT phase |
+| v3 | bf16-then-QAT, **min_lr=2e-4** | 1.5155 / 4.55 | 2.40 / 11.0 | better but still vote-backward |
+| v4a | + **STE backward** | 1.5155 / 4.55 (resumed) | **1.5734 / 4.82** | first ternary near FP floor |
+| v5 | + **var-length training** | 1.6107 / 5.01 | (didn't finish QAT phase) | plateau detector bug masked stall |
+| v5b | + **restart with --skip-optimizer** + plateau-bug fix | 1.6056 / 4.98 | **1.5977 / 4.94** | live deployment |
+
+The ternary model deployed today is at PPL 4.94, **0.04 nats above the bf16 floor**. Effectively ternary matches FP at this scale.
+
+### Diagnoses we had to make to get here
+
+1. **Vote-backward is wrong at <200M scale.** Production 130M PoC uses STE; vote-backward only at 2B+. STE was the fix for v4.
+2. **min_lr starved QAT phase.** Production uses min_lr=2e-4 (1.5× decay). We had 3e-5 (10× decay). Fixed in v3.
+3. **NoPE alone doesn't give long-context.** Need variable-length training. v5+ uses {256/512/1024/2048} mix.
+4. **bf16-then-QAT plateau detector bug:** rolling-window baseline let oscillating vals never trigger plateau. Fixed to compare against phase-appropriate all-time best.
+5. **Trainer didn't save QAT-mode-best separately.** best.pt always landed on bf16 phase (lower val). Added best_qat.pt — saves whenever vloss < best_qat_val while QAT is on.
+6. **Restart with --skip-optimizer un-sticks plateaus.** Validated empirically v5 → v5b: same config except fresh Adam state, broke through v5's plateau within 2K steps.
+
+### Memory artifacts (under /home/suraj/.claude/projects/-data-sematic-embedding/memory/)
+
+All saved as feedback/project memories so future-Claude doesn't re-discover:
+
+- `feedback_data_dominates_architecture.md`
+- `feedback_features_are_inductive_biases.md` (M+I/Highway/HetMoE are priors not overhead)
+- `feedback_gpu_resident_corpus.md`
+- `feedback_qat_after_lr_halve.md`, `feedback_qat_soft_transition.md`, `feedback_qat_trigger_logic.md`
+- `feedback_ste_vs_vote_backward.md` (production 130M uses STE)
+- `feedback_track_qat_and_fp_best_separately.md`
+- `feedback_var_length_for_extrapolation.md`
+- `feedback_restart_helps_convergence.md`
+- `feedback_attention_dead_zones_at_4layer.md` (mid-layer attention is normally dead at shallow depth)
+- `project_offline_browser_chatbot_product.md` (the productization vision)
+- `project_hierarchical_domain_moe.md` (the next-gen architecture)
+
+### What's deployed
+
+- **Live demo:** https://surajbhan.github.io/tinyhetmoe/ — interactive WASM dashboard, click-to-extend story
+- **Blog:** https://surajbhan.github.io/tinyhetmoe/blog.html — 2 posts narrating the build
+- **Journal:** https://surajbhan.github.io/tinyhetmoe/journal.html — auto-rendered from this file
+- Repo: https://github.com/surajbhan/tinyhetmoe
+- Model: docs/tiny.bin, 15 MB packed HTMOE003, val 1.5977 / PPL 4.94
+
+### Next-gen plan committed
+
+User's vision: **HetMoE-of-HetMoEs**. Per-token outer router picks a domain expert (each whole HetMoE trained on different data); each domain expert internally does the existing HetMoE top-2 routing across architectures. Generation can fluidly switch domains: `[Tool] <call>...</call> [Tool] Result. [Stories] Wow, that's small. [Wiki] Mathematically, ...`.
+
+System-level routing PER TOKEN. Inner architecture-level routing PER TOKEN PER LAYER (existing HetMoE). Two routing levels, both per-token.
+
+**Sanity-test plan (next session):**
+
+1. Stop v5b ✓ (done, snap at /tmp/v5b_best_qat.pt and /tmp/v5b_bf16_best.pt)
+2. Build unified Qwen-tokenizer vocab covering TinyStories + WikiText (script ready: scripts/prepare_data_unified.py)
+3. Train two models in parallel — one GPU each, no DDP:
+   - GPU 0: Stories model, ~10K steps, unified vocab + v5b recipe (var-length, STE, min_lr=2e-4, qat_on_plateau, restart-on-plateau)
+   - GPU 1: Wiki model, same recipe + same vocab + same architecture
+4. Build small classifier (132 → 64 → 2 MLP, EMA over meaning vectors)
+5. Sanity test: classifier should pick Stories on Stories prompts, Wiki on Wiki prompts, alternate token-by-token on mixed prompts
+6. If passes: resume both to convergence, add Tool model (xLAM), publish
+
+**Key architectural decisions:**
+- Shared trunk, swap MoE per-token? OR independent models, swap per-token? (User's clarification: per-token-of-whole-HetMoE — option A in earlier discussion)
+- KV cache implication: each domain model maintains its own KV; classifier switches active model. Feasible at our small scale.
+- Vocab: Qwen2.5 tokenizer pruned to ~16K covering both corpora. Aligns with our existing meaning extraction pipeline.
+
+**State of repo at end of this session:**
+- v5b model deployed (PPL 4.94)
+- Trainer has var_lengths, qat_backward_mode, qat_on_plateau, best_qat tracking, fixed plateau detector
+- Long-context eval script exists (`scripts/eval_extrapolation.py`)
+- Unified-vocab dataprep script ready (`scripts/prepare_data_unified.py`) — NOT YET RUN
+- Disk: 198 GB used / 220 GB. ~11 GB free after cleaning v5/v5b intermediates.
+
+### Tomorrow's workflow if context resets
+
+1. Read CHECKPOINTS.md for snapshot inventory
+2. Read this journal entry
+3. Check memory/ for the project_hierarchical_domain_moe.md file — that's the live plan
+4. v5b's snap is at `/tmp/v5b_best_qat.pt` (ternary, val 1.5977) and `/tmp/v5b_bf16_best.pt` (bf16, val 1.6056)
+5. Run `scripts/prepare_data_unified.py` to build unified vocab + tokenize TinyStories + WikiText
+6. Then train Stories + Wiki on separate GPUs (configs need to be written)
+7. Build classifier, test routing
+
+---
+
 ## 2026-04-30 11:25 — v4a stopped, v5 launched with var-length training
 
 ### v4a final result

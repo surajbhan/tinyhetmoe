@@ -640,31 +640,36 @@ def main():
                           f"PPL {math.exp(best_qat_val):.2f}) ←★ deployment artifact",
                           flush=True)
 
-                # Plateau detection — uses phase-appropriate best.
+                # Plateau detection — count consecutive non-improving vals
+                # against the **phase-appropriate all-time best**, not against
+                # a rolling window. The rolling-window baseline let oscillating
+                # vals (e.g. 1.7 / 1.8 / 1.7 / 1.8 ...) read as "improving"
+                # within each 9-val slice while never beating the actual best.
                 if beat_phase_best:
                     val_history = [(step, vloss)]
                 else:
-                    if len(val_history) >= tcfg.lr_plateau_patience + 1:
-                        recent = val_history[-(tcfg.lr_plateau_patience + 1):]
-                        base = recent[0][1]
-                        no_improve = all(v >= base * 0.999 for _, v in recent[1:])
-                        if no_improve:
-                            # First plateau in bf16 phase + qat_on_plateau:
-                            # enable QAT instead of halving LR. After this
-                            # the detector reverts to normal LR halving.
-                            if (tcfg.qat_on_plateau
-                                    and not qat_currently_on
-                                    and not tcfg.qat_from_zero):
-                                qat_trigger_pending = True
-                            elif scaled_lr > tcfg.lr_floor * 1.5:
-                                old = scaled_lr
-                                current_lr_scale *= tcfg.lr_decay_factor
-                                new_lr = max(tcfg.lr_floor,
-                                              base_lr * current_lr_scale)
-                                print(f"  ⚠ plateau: halving LR {old:.2e} → "
-                                      f"{new_lr:.2e} (scale "
-                                      f"×{current_lr_scale:.3f})", flush=True)
-                                val_history = [(step, vloss)]
+                    # vals_since_best counts entries we've seen without beating
+                    # the phase best (val_history was reset to [best] at the
+                    # last beat, so its length minus 1 = consecutive misses).
+                    vals_since_best = len(val_history) - 1
+                    if vals_since_best >= tcfg.lr_plateau_patience:
+                        # First plateau in bf16 phase + qat_on_plateau:
+                        # enable QAT instead of halving LR. After this
+                        # the detector reverts to normal LR halving.
+                        if (tcfg.qat_on_plateau
+                                and not qat_currently_on
+                                and not tcfg.qat_from_zero):
+                            qat_trigger_pending = True
+                        elif scaled_lr > tcfg.lr_floor * 1.5:
+                            old = scaled_lr
+                            current_lr_scale *= tcfg.lr_decay_factor
+                            new_lr = max(tcfg.lr_floor,
+                                          base_lr * current_lr_scale)
+                            print(f"  ⚠ plateau ({vals_since_best} vals "
+                                  f"since best): halving LR {old:.2e} → "
+                                  f"{new_lr:.2e} (scale "
+                                  f"×{current_lr_scale:.3f})", flush=True)
+                            val_history = [(step, vloss)]
             # All ranks need the new lr_scale if it changed; broadcast.
             if is_ddp:
                 ls = torch.tensor([current_lr_scale], dtype=torch.float64,

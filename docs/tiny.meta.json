@@ -1,7 +1,7 @@
 {
   "format": "HTMOE003",
-  "training_step": 22000,
-  "best_val": 1.6056300854682923,
+  "training_step": 27500,
+  "best_val": 1.5976673436164857,
   "config": {
     "vocab_size": 5967,
     "meaning_dim": 132,
@@ -50,5 +50,5 @@
     "Bottleneck"
   ],
   "ternary_params": 36231624,
-  "sparsity_zeros_frac": 0.3349413760752209
+  "sparsity_zeros_frac": 0.34040547009430216
 }

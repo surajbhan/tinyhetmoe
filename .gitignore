@@ -8,14 +8,12 @@ logs/
 data/train.bin
 data/val.bin
 
-# Trained model weights — committed to docs/tiny.bin once v2 finishes
-# (so GitHub Pages serves it directly). Until then, gitignore so we
-# don't accidentally check in the in-flight v1 weights.
-docs/tiny.bin
-docs/tiny_v2.bin
-# Old path (pre-rename to docs/) — keep for safety
+# Old path (pre-rename to docs/) — gitignore for safety
 ui/tiny.bin
 ui/tiny_v2.bin
+# Note: docs/tiny.bin IS committed (~15 MB packed) so GitHub Pages
+# serves the model directly. Re-export with:
+#   python3 scripts/export_model.py --ckpt <ckpt.pt> --out docs/tiny.bin
 
 # ── Python ────────────────────────────────────────────────────────────
 __pycache__/

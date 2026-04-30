@@ -111,7 +111,10 @@ def write_fp32(f, tensor: torch.Tensor) -> int:
 
 def write_ternary(f, weight: torch.Tensor) -> tuple[int, int, int, int, int]:
     """Write tensor as: f32 scale, u32 ndim, ndim u32 shape, total int8 values.
-    Returns (bytes_written, total, zeros, pos, neg)."""
+    Returns (bytes_written, total, zeros, pos, neg).
+
+    HTMOE002 (legacy): one int8 per weight.
+    """
     alpha, w_t = quantize_ternary(weight)
     f.write(struct.pack("<f", alpha))
     f.write(struct.pack("<I", w_t.ndim))
@@ -126,7 +129,42 @@ def write_ternary(f, weight: torch.Tensor) -> tuple[int, int, int, int, int]:
     return bytes_written, total, zeros, pos, neg
 
 
-def export_model(ckpt_path: str, out_path: str):
+def write_ternary_packed(f, weight: torch.Tensor) -> tuple[int, int, int, int, int]:
+    """HTMOE003 packed-ternary writer: 4 weights per byte (2 bits each).
+
+    Encoding (matches Rust tensor.rs):
+      00 → 0
+      01 → +1
+      11 → -1
+      10 → reserved (unused)
+
+    Layout: f32 scale, u32 ndim, ndim u32 shape, ceil(total/4) packed bytes.
+    """
+    alpha, w_t = quantize_ternary(weight)
+    flat = w_t.reshape(-1)
+    n = flat.size
+    n_bytes = (n + 3) // 4
+    packed = np.zeros(n_bytes, dtype=np.uint8)
+    for i in range(n):
+        v = int(flat[i])
+        bits = 0b00 if v == 0 else (0b01 if v == 1 else 0b11)
+        packed[i // 4] |= bits << ((i % 4) * 2)
+
+    f.write(struct.pack("<f", alpha))
+    f.write(struct.pack("<I", w_t.ndim))
+    for dim in w_t.shape:
+        f.write(struct.pack("<I", dim))
+    f.write(packed.tobytes())
+
+    total = int(n)
+    zeros = int((w_t == 0).sum())
+    pos = int((w_t == 1).sum())
+    neg = int((w_t == -1).sum())
+    bytes_written = 4 + 4 + 4 * w_t.ndim + n_bytes
+    return bytes_written, total, zeros, pos, neg
+
+
+def export_model(ckpt_path: str, out_path: str, packed: bool = True):
     print(f"[export] loading {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg_dict = ckpt.get("config", {})
@@ -164,9 +202,11 @@ def export_model(ckpt_path: str, out_path: str):
     bytes_packed = 0
     bytes_fp = 0
 
-    print(f"[export] writing {out_path}")
+    magic = b"HTMOE003" if packed else b"HTMOE002"
+    write_ternary_fn = write_ternary_packed if packed else write_ternary
+    print(f"[export] writing {out_path} ({'packed 2-bit' if packed else 'int8'} ternary)")
     with open(out_path, "wb") as f:
-        f.write(b"HTMOE002")
+        f.write(magic)
 
         # Config header
         f.write(struct.pack("<I", cfg.vocab_size))
@@ -196,7 +236,7 @@ def export_model(ckpt_path: str, out_path: str):
 
         # Expand projection (ternary)
         print("[export] expand", model.expand.weight.shape)
-        bw, t, z, p, n = write_ternary(f, model.expand.weight)
+        bw, t, z, p, n = write_ternary_fn(f, model.expand.weight)
         bytes_packed += bw
         total_params += t
         total_zeros += z
@@ -213,7 +253,7 @@ def export_model(ckpt_path: str, out_path: str):
             # Attention projections (ternary)
             for name in ["w_q", "w_k", "w_v", "w_o"]:
                 proj = getattr(layer.attn, name)
-                bw, t, z, p, n = write_ternary(f, proj.weight)
+                bw, t, z, p, n = write_ternary_fn(f, proj.weight)
                 bytes_packed += bw
                 total_params += t
                 total_zeros += z
@@ -224,7 +264,7 @@ def export_model(ckpt_path: str, out_path: str):
                 weight_names = EXPERT_WEIGHT_NAMES[arch]
                 for wn in weight_names:
                     proj = getattr(expert, wn)
-                    bw, t, z, p, n = write_ternary(f, proj.weight)
+                    bw, t, z, p, n = write_ternary_fn(f, proj.weight)
                     bytes_packed += bw
                     total_params += t
                     total_zeros += z
@@ -240,7 +280,7 @@ def export_model(ckpt_path: str, out_path: str):
 
         # Compress (ternary)
         print("[export] compress", model.compress.weight.shape)
-        bw, t, z, p, n = write_ternary(f, model.compress.weight)
+        bw, t, z, p, n = write_ternary_fn(f, model.compress.weight)
         bytes_packed += bw
         total_params += t
         total_zeros += z
@@ -250,7 +290,7 @@ def export_model(ckpt_path: str, out_path: str):
 
         # lm_head (ternary — biggest single tensor, big win)
         print("[export] lm_head", model.lm_head.weight.shape)
-        bw, t, z, p, n = write_ternary(f, model.lm_head.weight)
+        bw, t, z, p, n = write_ternary_fn(f, model.lm_head.weight)
         bytes_packed += bw
         total_params += t
         total_zeros += z
@@ -268,7 +308,7 @@ def export_model(ckpt_path: str, out_path: str):
     # Sidecar metadata for the UI
     meta_path = Path(out_path).with_suffix(".meta.json")
     meta = {
-        "format": "HTMOE002",
+        "format": "HTMOE003" if packed else "HTMOE002",
         "training_step": int(ckpt.get("step", 0)),
         "best_val": float(ckpt.get("best_val", float("nan"))),
         "config": {
@@ -299,5 +339,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", required=True)
     p.add_argument("--out", default="model.bin")
+    p.add_argument("--legacy", action="store_true",
+                   help="Write HTMOE002 (1 byte/weight) instead of HTMOE003 packed")
     args = p.parse_args()
-    export_model(args.ckpt, args.out)
+    export_model(args.ckpt, args.out, packed=not args.legacy)

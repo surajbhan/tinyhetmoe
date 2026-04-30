@@ -36,12 +36,14 @@ pub fn load_model_from_bytes(file_data: Vec<u8>) -> std::io::Result<Model> {
 
     let mut magic = [0u8; 8];
     cursor.read_exact(&mut magic)?;
-    if &magic != b"HTMOE002" {
-        return Err(std::io::Error::new(
+    let packed = match &magic {
+        b"HTMOE002" => false,                  // legacy: 1 byte / weight
+        b"HTMOE003" => true,                   // packed: 2 bits / weight (4 per byte)
+        _ => return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("Expected magic HTMOE002, got {:?}", magic),
-        ));
-    }
+            format!("Expected magic HTMOE002 or HTMOE003, got {:?}", magic),
+        )),
+    };
 
     let config = Config {
         vocab_size:    cursor.read_u32::<LittleEndian>()? as usize,
@@ -82,7 +84,7 @@ pub fn load_model_from_bytes(file_data: Vec<u8>) -> std::io::Result<Model> {
     let intuition_embed = read_fp32(&mut cursor, config.vocab_size * config.intuition_dim)?;
 
     // Highway expand
-    let expand = read_ternary(&mut cursor)?;
+    let expand = read_ternary(&mut cursor, packed)?;
 
     // Layers
     let mut layers = Vec::with_capacity(config.num_layers);
@@ -92,10 +94,10 @@ pub fn load_model_from_bytes(file_data: Vec<u8>) -> std::io::Result<Model> {
         let k_norm    = read_fp32_tensor(&mut cursor)?;
         let ffn_norm  = read_fp32_tensor(&mut cursor)?;
 
-        let q_proj = read_ternary(&mut cursor)?;
-        let k_proj = read_ternary(&mut cursor)?;
-        let v_proj = read_ternary(&mut cursor)?;
-        let o_proj = read_ternary(&mut cursor)?;
+        let q_proj = read_ternary(&mut cursor, packed)?;
+        let k_proj = read_ternary(&mut cursor, packed)?;
+        let v_proj = read_ternary(&mut cursor, packed)?;
+        let o_proj = read_ternary(&mut cursor, packed)?;
 
         let mut experts = Vec::with_capacity(config.num_experts);
         for e in 0..config.num_experts {
@@ -103,7 +105,7 @@ pub fn load_model_from_bytes(file_data: Vec<u8>) -> std::io::Result<Model> {
             let n_weights = arch.num_weights();
             let mut weights = Vec::with_capacity(n_weights);
             for _ in 0..n_weights {
-                weights.push(read_ternary(&mut cursor)?);
+                weights.push(read_ternary(&mut cursor, packed)?);
             }
             experts.push(Expert { arch, weights });
         }
@@ -118,11 +120,11 @@ pub fn load_model_from_bytes(file_data: Vec<u8>) -> std::io::Result<Model> {
     }
 
     // Highway compress
-    let compress = read_ternary(&mut cursor)?;
+    let compress = read_ternary(&mut cursor, packed)?;
     // Final norm
     let final_norm = read_fp32_tensor(&mut cursor)?;
     // lm_head (ternary, untied)
-    let lm_head = read_ternary(&mut cursor)?;
+    let lm_head = read_ternary(&mut cursor, packed)?;
 
     let mut remaining = Vec::new();
     cursor.read_to_end(&mut remaining)?;
@@ -167,7 +169,7 @@ fn read_fp32_tensor(cursor: &mut Cursor<Vec<u8>>) -> std::io::Result<Vec<f32>> {
     Ok(data)
 }
 
-fn read_ternary(cursor: &mut Cursor<Vec<u8>>) -> std::io::Result<PackedTernaryWeight> {
+fn read_ternary(cursor: &mut Cursor<Vec<u8>>, packed: bool) -> std::io::Result<PackedTernaryWeight> {
     let scale = cursor.read_f32::<LittleEndian>()?;
     let ndim = cursor.read_u32::<LittleEndian>()? as usize;
     let mut shape = vec![0usize; ndim];
@@ -177,8 +179,30 @@ fn read_ternary(cursor: &mut Cursor<Vec<u8>>) -> std::io::Result<PackedTernaryWe
     let rows = shape[0];
     let cols = if ndim > 1 { shape[1] } else { 1 };
     let count = rows * cols;
-    let mut buf = vec![0u8; count];
-    cursor.read_exact(&mut buf)?;
-    let data: Vec<i8> = buf.iter().map(|&b| b as i8).collect();
+
+    let data: Vec<i8> = if packed {
+        // HTMOE003: 4 weights per byte (2 bits each).
+        // Encoding: 00→0, 01→+1, 11→-1
+        let n_bytes = (count + 3) / 4;
+        let mut packed_buf = vec![0u8; n_bytes];
+        cursor.read_exact(&mut packed_buf)?;
+        let mut data = vec![0i8; count];
+        for i in 0..count {
+            let bits = (packed_buf[i / 4] >> ((i % 4) * 2)) & 0b11;
+            data[i] = match bits {
+                0b00 => 0,
+                0b01 => 1,
+                0b11 => -1,
+                _ => 0,  // 0b10 reserved/unused
+            };
+        }
+        data
+    } else {
+        // HTMOE002: 1 byte per weight
+        let mut buf = vec![0u8; count];
+        cursor.read_exact(&mut buf)?;
+        buf.iter().map(|&b| b as i8).collect()
+    };
+
     Ok(tensor::pack_ternary(&data, rows, cols, scale))
 }

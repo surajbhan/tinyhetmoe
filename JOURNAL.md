@@ -5,6 +5,59 @@ each gate (not just end-of-day). New entries on top.
 
 ---
 
+## 2026-04-30 01:00 — v3 launched: min_lr fix after diagnosing v2
+
+### v2 outcome
+
+v2 hit bf16 PPL 4.67 (matching Eldan & Li 30M FP baseline) at step 17000.
+Plateau-trigger fired at step 21000, QAT enabled. Loss jumped 1.54 → 4.93 in
+100 steps and never recovered: 11K QAT steps later still at val ~2.55 / PPL
+~12.7 with LR halved to 7.7e-5.
+
+### Diagnosis
+
+Read through `/data/training_kanam` production trainers (`train_poc.py`,
+`qat_qwen35.py`, `autoresearch/train.py`, `2b_pipeline/train_2b.py`). Three
+findings:
+
+1. **Vote-backward math is identical** between us and them — `grad × sign(w)`
+   with 0.1× rescue. Not the issue.
+2. **Production uses `min_lr = 2e-4`** (autoresearch). We had `min_lr = 3e-5`.
+   By the time QAT fires, our LR was already past the bf16-friendly range
+   and continued cosine-decaying into QAT — vote-backward updates couldn't
+   make big enough adjustments to recover.
+3. **Production switches ternary much later in the schedule** (autoresearch:
+   90% FP / 10% ternary) but they keep LR floored high so QAT phase has
+   plenty of effective LR.
+
+### v3 fix
+
+One-line change: `min_lr: 0.0002` (was `0.00003`). Resumed from v2's bf16
+best (step 17000, val 1.5418) — preserves all 4 hours of FP work, only
+redoes QAT phase with corrected LR.
+
+Config: [`training/configs/tiny_hetmoe_v3.json`](training/configs/tiny_hetmoe_v3.json)
+- `resume_from: /tmp/v2_bf16_best_step17000.pt`
+- `min_lr: 2e-4` (10× higher floor)
+- `max_steps: 50000` (down from 60K — already 17K in)
+- `qat_on_plateau: true` — should fire within 2-4K steps since model is
+  already at bf16 floor
+- All other recipe knobs unchanged
+
+Live at 96K tok/s. ETA: plateau-triggered QAT in ~2K steps, then ~28K
+steps of QAT-finetune at LR 2-2.7e-4. Total wall ~3h.
+
+### What we expect
+
+- QAT switch will still cause loss jump (vote-backward shock is unavoidable)
+- BUT recovery should be much faster + reach lower floor because LR
+  doesn't starve out
+- Target: ternary val ≤ 2.0 (PPL ~7.5), beating v1 (PPL 21) and v2-QAT
+  (PPL 12.7)
+- Stretch: ternary val ≤ 1.8 (PPL ~6), close to bf16 floor
+
+---
+
 ## 2026-04-29 22:00 — Switched to plateau-triggered QAT mid-run
 
 User redirect: instead of fixed `qat_start_step=48000` (guess), trigger

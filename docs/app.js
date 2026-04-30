@@ -58,9 +58,17 @@ async function boot() {
   axisDescriptions = axisDescRes;
   buildEncoderTables();
 
-  setMeta("Loading model weights (42 MB)…");
+  // First do a HEAD request to get the actual size before streaming.
+  let knownSize = 0;
+  try {
+    const head = await fetch("tiny.bin", { method: "HEAD" });
+    knownSize = parseInt(head.headers.get("Content-Length") || "0", 10);
+  } catch (e) { /* fall back to 0; we'll show "X MB" without a denominator */ }
+  const sizeStr = knownSize > 0 ? `${(knownSize / 1e6).toFixed(1)} MB` : "model weights";
+  setMeta(`Loading ${sizeStr}…`);
+
   const binRes = await fetch("tiny.bin");
-  const total = parseInt(binRes.headers.get("Content-Length") || "0", 10);
+  const total = parseInt(binRes.headers.get("Content-Length") || String(knownSize), 10);
   const reader = binRes.body.getReader();
   const chunks = [];
   let received = 0;
@@ -70,22 +78,27 @@ async function boot() {
     chunks.push(value);
     received += value.length;
     if (total > 0) {
-      setMeta(`Downloading model: ${(received / 1e6).toFixed(1)} / ${(total / 1e6).toFixed(0)} MB…`);
+      setMeta(`Downloading: ${(received / 1e6).toFixed(1)} / ${(total / 1e6).toFixed(1)} MB…`);
+    } else {
+      setMeta(`Downloading: ${(received / 1e6).toFixed(1)} MB…`);
     }
   }
   const blob = new Uint8Array(received);
   let off = 0;
   for (const c of chunks) { blob.set(c, off); off += c.length; }
+  // Remember actual model size for later display
+  modelMeta._download_bytes = received;
 
   setMeta("Building model in WASM…");
   const t0 = performance.now();
   model = new WasmModel(blob);
   const tLoad = performance.now() - t0;
+  const actualMB = (received / 1e6).toFixed(1);
   setMeta(
-    `Model loaded: ${model.vocab_size} vocab, ${model.num_layers} layers × ` +
-    `${model.num_heads} heads, ${model.num_experts} experts. ` +
+    `${actualMB} MB model · ${model.vocab_size} vocab, ${model.num_layers}L × ` +
+    `${model.num_heads}H, ${model.num_experts} experts. ` +
     `Trained at step ${modelMeta.training_step}, val ${modelMeta.best_val.toFixed(4)} ` +
-    `(PPL ${Math.exp(modelMeta.best_val).toFixed(1)}). Load time ${tLoad.toFixed(0)}ms.`
+    `(PPL ${Math.exp(modelMeta.best_val).toFixed(1)}). Load ${tLoad.toFixed(0)}ms.`
   );
 
   document.getElementById("ckpt-step").textContent = modelMeta.training_step;

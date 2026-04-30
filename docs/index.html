@@ -40,9 +40,13 @@
     <section id="story-section" class="card story-card">
       <div class="card-head">
         <h2>Your story</h2>
+        <div class="prompt-block">
+          <label for="prompt-input" class="prompt-label">Prompt &mdash; type the start of a story</label>
+          <textarea id="prompt-input" rows="2"
+                    placeholder="Once upon a time, there was a happy little...">Once upon a time, there was a happy little</textarea>
+        </div>
         <div class="controls">
-          <input type="text" id="prompt-input" value="Once upon a time, there was a happy little" />
-          <button id="run-btn" title="Reset and run prompt from scratch">Run</button>
+          <button id="run-btn" title="Reset and run prompt from scratch">Run prompt</button>
           <button id="reset-btn" title="Reset story to just the prompt">Reset</button>
           <button id="step-btn" title="Take one auto-pick step">+1</button>
           <button id="auto-btn" title="Auto-complete N tokens">Auto+50</button>

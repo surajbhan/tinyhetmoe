@@ -278,6 +278,36 @@ body {
   flex-shrink: 0;
 }
 
+/* ── Prompt block (textarea + label) ─────────────────────────────── */
+.prompt-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+.prompt-label {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+#prompt-input {
+  width: 100%;
+  min-height: 44px;
+  resize: vertical;
+  padding: 8px 10px;
+  font-size: 13px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-family: var(--mono);
+  outline: none;
+  line-height: 1.5;
+}
+#prompt-input:focus { border-color: var(--accent); }
+#prompt-input::placeholder { color: var(--text-faint); font-style: italic; }
+
 /* ── Story controls ──────────────────────────────────────────────── */
 .controls {
   display: flex;

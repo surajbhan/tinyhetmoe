@@ -1,7 +1,7 @@
 {
   "format": "HTMOE003",
-  "training_step": 38500,
-  "best_val": 1.5154789805412292,
+  "training_step": 22000,
+  "best_val": 1.6056300854682923,
   "config": {
     "vocab_size": 5967,
     "meaning_dim": 132,
@@ -12,7 +12,7 @@
     "num_layers": 4,
     "num_heads": 4,
     "head_dim": 132,
-    "max_seq_len": 512,
+    "max_seq_len": 2048,
     "num_experts": 4,
     "top_k_experts": 2,
     "ffn_mult": 2.0
@@ -50,5 +50,5 @@
     "Bottleneck"
   ],
   "ternary_params": 36231624,
-  "sparsity_zeros_frac": 0.362669473496413
+  "sparsity_zeros_frac": 0.3349413760752209
 }

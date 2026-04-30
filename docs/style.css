@@ -39,15 +39,23 @@ html, body {
   line-height: 1.4;
   background: var(--bg);
   color: var(--text);
-  height: 100vh;
-  overflow: hidden;
 }
 
 body {
-  display: flex;
-  flex-direction: column;
-  height: 100vh;
   padding: 10px 14px 12px;
+}
+
+/* Desktop: lock to viewport (no-scroll dashboard layout). Mobile keeps
+   natural flow so users can scroll through the panels. */
+@media (min-width: 1101px) {
+  html, body {
+    height: 100vh;
+    overflow: hidden;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+  }
 }
 
 ::selection { background: var(--accent); color: var(--bg); }
@@ -657,12 +665,21 @@ body {
   .story-card, .explain-card, .topk-card, .meaning-card, .attn-card {
     grid-column: 1;
     grid-row: auto;
-    min-height: 220px;
+    min-height: 0;
   }
-  .topk-card { min-height: 280px; }
-  #story { max-height: 200px; }
-  #topk { max-height: 280px; }
-  #explain { max-height: none; }
+  /* Mobile: panels grow to their natural content size — page scrolls
+     normally instead of trapping scroll inside each panel. */
+  #story, #topk, #meaning, #explain, #attn, #route {
+    max-height: none;
+    overflow: visible;
+    flex: none;
+  }
+  /* Cap the story scroll only when it gets really long, so the prompt
+     UI doesn't get pushed way down on a long generation. */
+  #story {
+    max-height: 320px;
+    overflow-y: auto;
+  }
   .attn-route-grid {
     grid-template-columns: 1fr;
     gap: 16px;

@@ -14,19 +14,24 @@
       <span class="subtitle">
         A 38M-parameter <b>ternary</b> language model that runs entirely in your browser.
         Built around a 132-axis <b>named meaning embedding</b> &mdash; so every prediction can be
-        explained, not just measured. Designed for <b>infinite context</b> via meaning-protected
-        attention. Click tokens to inspect; click candidates to extend.
+        explained, not just measured. Click tokens to inspect; click candidates to extend.
+        See the <a href="blog.html" class="header-link">blog</a> for how it was built or the
+        <a href="journal.html" class="header-link">journal</a> for the day-by-day log.
       </span>
     </div>
     <div class="topbar-right">
-      <span class="meta-chip" id="meta">Loading…</span>
-      <span class="meta-chip">step <b id="ckpt-step">…</b></span>
-      <span class="meta-chip">val <b id="ckpt-val">…</b> · PPL <b id="ckpt-ppl">…</b></span>
-      <span class="meta-chip">QAT <b id="qat-status">…</b></span>
-      <span class="meta-chip" id="tps-chip">⚡ <b id="tps-val">—</b> tok/s</span>
-      <a href="blog.html" class="meta-chip nav-link">blog</a>
-      <a href="journal.html" class="meta-chip nav-link">journal</a>
-      <a href="https://github.com/surajbhan/tinyhetmoe" target="_blank" class="meta-chip nav-link">github</a>
+      <nav class="topbar-nav">
+        <a href="blog.html" class="nav-pill">blog</a>
+        <a href="journal.html" class="nav-pill">journal</a>
+        <a href="https://github.com/surajbhan/tinyhetmoe" target="_blank" class="nav-pill">github ↗</a>
+      </nav>
+      <div class="topbar-stats">
+        <span class="meta-chip" id="meta">Loading…</span>
+        <span class="meta-chip">step <b id="ckpt-step">…</b></span>
+        <span class="meta-chip">val <b id="ckpt-val">…</b> · PPL <b id="ckpt-ppl">…</b></span>
+        <span class="meta-chip">QAT <b id="qat-status">…</b></span>
+        <span class="meta-chip" id="tps-chip">⚡ <b id="tps-val">—</b> tok/s</span>
+      </div>
     </div>
   </header>
 

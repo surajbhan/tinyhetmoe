@@ -510,24 +510,30 @@ def main():
                 log_f.flush()
 
     while step < tcfg.max_steps:
-        # ── QAT enable: fixed-step or plateau-triggered ─────────────────
+        # ── QAT enable: fixed-step, plateau, or 90% backstop ───────────
+        # Trigger logic: (qat_start_step) OR (plateau detected) OR
+        # (step >= 90% of max_steps) — the backstop ensures QAT always
+        # fires before the run ends, even if the bf16 phase never plateaued.
         if not qat_currently_on:
+            backstop_trigger = (tcfg.qat_on_plateau
+                                 and not tcfg.qat_from_zero
+                                 and step >= int(0.9 * tcfg.max_steps))
             if tcfg.qat_start_step > 0 and step >= tcfg.qat_start_step:
                 enable_qat(f"qat_start_step={tcfg.qat_start_step}")
-                # Reset val_history so plateau detector doesn't immediately
-                # halve LR (val will jump up briefly when QAT kicks in)
                 val_history = []
-            elif qat_trigger_pending:
-                # Broadcast across ranks first (rank 0 set the flag from
-                # validation; other ranks need to know).
-                if is_ddp:
+            elif qat_trigger_pending or backstop_trigger:
+                # Broadcast across ranks first (rank 0 sets the flag from
+                # validation; other ranks need to know). Backstop is
+                # step-based and identical on all ranks, no broadcast.
+                if is_ddp and qat_trigger_pending:
                     flag = torch.tensor([1.0 if qat_trigger_pending else 0.0],
                                          dtype=torch.float64, device=device)
                     dist.broadcast(flag, src=0)
                     qat_trigger_pending = bool(flag.item())
-                if qat_trigger_pending:
-                    enable_qat("plateau detected")
-                    val_history = []
+                reason = ("plateau detected" if qat_trigger_pending
+                          else f"90% backstop (step {step}/{tcfg.max_steps})")
+                enable_qat(reason)
+                val_history = []
                 qat_trigger_pending = False
 
         # Pick a (seq_len, micro_batch) pair for this entire optimizer step.

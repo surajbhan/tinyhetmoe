@@ -5,6 +5,445 @@ each gate (not just end-of-day). New entries on top.
 
 ---
 
+## 2026-04-30 22:20 — v6.5 batch 1 done (pg19 + wiki, 1 GB, bf16 → QAT)
+
+Both runs completed 30 K steps cleanly. QAT enabled at step 27 000
+via the new 90 % backstop trigger (added to trainer earlier today).
+3 K steps of QAT recovery after the hard-flip.
+
+### Final numbers
+
+| corpus | bf16 best (val) | bf16 PPL | QAT best (val) | QAT PPL | Δ (nats) |
+|--------|----------------:|---------:|---------------:|--------:|---------:|
+| pg19   |          3.9331 |     51.0 |         4.1848 |    65.7 |   +0.252 |
+| wiki   |          3.4214 |     30.6 |         3.7471 |    42.4 |   +0.326 |
+
+For comparison, v5b (TinyStories 38M) shipped at +0.4 nats QAT-vs-bf16.
+Both v6.5 experts are below that on the harder corpora — comfortably
+publishable as ternary deployments.
+
+### Improvement vs v6 (200 MB / 10 K steps / bf16-only)
+
+  • PG-19: 4.33 → 3.93 (bf16) = **−0.40 nats** from more data and
+    longer training. QAT 4.18 still beats v6's bf16 by 0.15 nats.
+  • Wiki:  3.78 → 3.42 (bf16) = **−0.36 nats**. QAT 3.75 also beats
+    v6 bf16 by 0.03.
+
+### QAT recovery curve
+
+User flagged the 1.5B precedent — fast recovery in ~4 QAT steps then
+beats fp. We saw a similar shape at smaller scale:
+
+  • pg19: post-flip 4.28 → 4.29 → 4.24 → 4.23 → 4.18 → 4.21
+    (steady descent from step 27 500 to 29 500, then mild oscillation)
+  • wiki: post-flip 3.97 → 3.75 → 3.88 → 3.77 → 3.79 → 3.77
+    (best @ 28 000, plateau-oscillation thereafter)
+
+Different shapes — pg19 had more room to recover (deeper bf16 phase
+was less converged), wiki settled fast. No soft-transition needed at
+this scale; the longer bf16 pre-training (27 K steps on 1 GB) gave
+enough weight stability that hard-flip is cheap.
+
+### Why this matters for the swarm thesis
+
+User's framing: 4 specialized 50 M experts, distributed over network
+via WebSocket. Two distinct scenarios with very different latency
+characteristics:
+
+  • **Intra-LAN** (household swarm): per-token RTT ~1 ms. Network is
+    invisible; compute on the active expert dominates.
+  • **WAN swarm** (global distributed inference): per-token RTT
+    ~50-200 ms (transcontinental ping baseline). Still cheaper per
+    token than a current cloud LLM API call (30-80 ms first byte).
+
+The interesting case is WAN — that's the true "dream" scenario where
+any node anywhere serves a token. Even at 100 ms WAN RTT, the
+architecture works because routing is sticky (98 % classifier acc =
+neighbouring tokens overwhelmingly route to the same expert, so the
+RTT cost fires once per turn, not once per token).
+
+The UI for the 2-expert tab will surface this as a toggle: off /
+LAN-sim (5 ms) / WAN-sim (50-100 ms), so the user can feel what each
+distribution scenario actually looks like. Cold KV warmup on routing
+switch is ~1-2 sec for a 500-token history regardless of network — a
+fixed compute cost, not a transferred-bytes cost.
+
+### Vocab patch interlude
+
+Mid-run, realized the unified ChatML tool corpus needed `<|im_start|>`,
+`<|im_end|>`, `<tool_call>`, `</tool_call>` as native single tokens.
+Patched vocab from 32768 → 32772 by appending the 4 specials at the
+end. Original tokens 0..32767 untouched (after recovering from a
+swap-mode false start; verified by tokenizer round-trip + pg19 best.pt
+generation test on a probe containing all 4 of the rare displaced
+tokens — clean output, no embedding corruption).
+
+In-flight pg19/wiki training was unaffected (axes loaded into GPU RAM
+at startup; on-disk vocab patch happened mid-training but didn't
+propagate). Their best.pt files have the original 32768 embedding
+shape and need to be padded to 32772 (add 4 zero rows) before they
+can be used with the new architecture for stitching.
+
+### Tool corpus unification
+
+Glaive + Salesforce/xLAM-60k + NousResearch/hermes-fc-v1 → unified
+ChatML format (Hermes-style: `<tool_call>` / `<tool_response>` blocks,
+JSON-Schema tool definitions, native ChatML special tokens).
+
+  • glaive:  112 960 conversations, 263 MB
+  • xlam:     60 000 conversations, 118 MB
+  • hermes:    1 893 conversations,  17 MB
+  • Total: **174 753 conversations, 386 MB raw**
+
+Re-tokenized → 91 M training tokens, 0.93 M val. **Unk rate dropped
+from 5.39 % (with mid-vocab swap) to 2.77 % (with append + ChatML
+specials in vocab)** — every structural ChatML token now resolves to
+its canonical single-token id, not `<unk>`.
+
+### Padded-checkpoint verification — surfaced two real architecture facts
+
+Padded all 4 (pg19/wiki × best/best_qat) from vocab=32768 → 32772 via
+`scripts/pad_checkpoint_vocab.py`. New rows:
+  - `meaning_embed`: filled from production Qwen contextual file
+    (correct semantics for the 4 ChatML qids)
+  - `intuition_embed`, `lm_head`: zero-padded
+  - 4 ChatML tids must be **logit-masked at inference** for prose
+    experts (pg19/wiki/code) since they should never emit ChatML.
+
+Verified via `scripts/verify_padded_checkpoints.py` → val numbers
+match training within 0.13 nats, generation is coherent prose for all
+4 cases (bf16 + QAT both work).
+
+**Two real architecture facts surfaced during this debugging:**
+
+1. **`lm_head` must stay FP, not ternary**, in the deployed Rust
+   engine. The model's `forward(ids, targets)` path uses an FP
+   shortcut for the loss matmul (`tiny_hetmoe.py:465`) — the QAT
+   training loop never saw the lm_head ternarized, so the learned
+   weights are calibrated for FP. The current `export_model.py`
+   ternarizes lm_head, which would compound error. Fix: keep
+   lm_head as fp16 (~16 MB, modest bundle impact, big quality win).
+
+2. **`QuantizedLinear.quantize` is a Python attr, not a parameter** —
+   `load_state_dict` doesn't restore it. QAT checkpoints need
+   explicit `set_quantize_mode(model, on=True)` after loading.
+   Otherwise the model uses FP forward over the QAT-trained weights
+   → garbage. Same fix needed in Rust engine: per-expert flag for
+   "this expert's weights expect ternary forward."
+
+3. **Per-expert `masked_tids` in sidecar metadata** — each .bin's
+   `.meta.json` should include the list of vocab tids whose logits
+   are masked at inference. For pg19/wiki/code: `[32768, 32769,
+   32770, 32771]`. For tool: `[]` (it uses all of them). The wasm
+   engine reads the sidecar, applies the mask in-engine post-logits.
+
+Filed for the WASM dual-model work later in the session.
+
+### Next gates
+
+  1. Update v6.5 tool + code configs to vocab=32772.
+  2. Commit + push (gitignore catches `.bin`/`.npy`/`.bak`/
+     `tool_corpus_*`/`domain_classifier_*.pt`).
+  3. Launch batch 2: tool + code on GPU 0/1.
+  4. While batch 2 runs: build dual-model wasm engine + classifier-in-
+     Rust (with per-expert masked_tids + QAT flag from sidecar).
+  5. Manual browser testing of 2-expert stitched generation, with
+     latency simulation toggles (off / LAN-5ms / WAN-50ms).
+  6. After batch 2 lands: extend wasm + UI to 4-expert tab, publish.
+
+---
+
+## 2026-04-30 18:30 — v6 done; **stitching test passed, hierarchical MoE thesis confirmed**
+
+Both bf16 v6 runs finished at step 10 000:
+
+| corpus | best val | best PPL |
+|--------|---------:|---------:|
+| PG-19  |   4.3327 |     76.1 |
+| Wiki   |   3.7815 |     43.9 |
+
+(No QAT yet — these are the bf16 baseline. QAT comes in the next
+phase with 1 GB corpora.)
+
+### Cross-domain val matrix
+
+The decisive question for the swarm thesis: do specialized experts
+actually beat each other on their own domains? Ran both checkpoints
+on both vals (200 K tokens each):
+
+|              | pg19_val   | wiki_val   |
+|--------------|-----------:|-----------:|
+| pg19_expert  |   **4.38** |    7.99    |
+| wiki_expert  |     8.69   |  **3.84**  |
+
+In-domain advantage: **+4.30 nats** for PG-19, **+4.15 nats** for
+Wiki. That's PPL ratio of roughly 75:1 in-domain vs cross-domain —
+the wrong expert is barely literate on out-of-domain text. Not
+"slight specialization." Specialization is the dominant signal.
+
+### Stitched sequence (alternating 200-token chunks, 200 K tokens total)
+
+Single-expert baselines on the stitched seq:
+  • pg19_only: **CE 6.43** (PPL 618) — half the tokens are out-of-domain
+  • wiki_only: **CE 6.47** (PPL 647) — symmetric
+
+Oracle routing (ground-truth chunk labels, 50/50 routing):
+  • **CE 4.40** (PPL 82) — almost matches in-domain numbers!
+  • Saves **+2.03 nats** vs the best single-expert baseline.
+
+Learned routing (132→64→2 classifier from earlier today, EMA over
+meaning vectors per token):
+  • **CE 4.79** (PPL 120) — beats single-expert by 1.64 nats
+  • Gap to oracle: **+0.39 nats** — the cost of routing imperfection
+    (mostly the 16-token lock-in window after each chunk transition,
+    matching the 91 % acc-at-16-tokens from the classifier eval)
+
+### What this proves (and what's next)
+
+  • **Specialization is real** at this scale: per-domain experts crush
+    cross-domain queries. The swarm thesis has empirical support.
+  • **Experts compose**: oracle routing on a mixed sequence almost
+    matches in-domain performance. Stitching works architecturally.
+  • **Learned routing is viable** but the imperfection has a real cost
+    (~0.4 nats). Reducible by (a) longer EMA windows, (b) sticky
+    routing (only switch when confidence high), (c) bigger classifier.
+    This is post-MVP optimization.
+
+### Updated plan: phase 2
+
+User direction: skip QAT for now (these were bf16-only), then do the
+full production train next:
+
+  1. Bump prep script to **1 GB per corpus** (5× current). Current
+     200 MB / ~5 epochs caps PG-19 around step 5-6 K (saw the slope
+     flatten). 1 GB / ~25 epochs gives plenty of room.
+  2. Add **QAT recipe** to v6 configs: bf16-then-QAT with soft
+     transition + plateau trigger + QAT-best tracking (all v5b
+     validated tools).
+  3. Train all **4 experts**: pg19, wiki, tool, code. Two GPUs → two
+     batches of two, or one at a time.
+  4. Re-run this stitching eval on ternary checkpoints (the
+     production target). Expect oracle to take a small QAT hit but
+     remain below single-expert baselines by a wide margin.
+
+### Files written this gate
+
+  • `scripts/eval_stitching.py` — cross-domain matrix + stitched
+    routing eval. Reusable for the 4-expert version (just expand the
+    `models` dict).
+  • `data/domain_classifier_pg19_wiki.pt` — already saved earlier
+    (10 KB).
+
+---
+
+## 2026-04-30 18:10 — domain classifier trained (while v6 still running)
+
+The hierarchical-MoE thesis has two binding questions: can the experts
+specialize, and can we route between them? With training still in
+progress on GPU 0/1, decided to answer the routing question right
+now — it's CPU-only and depends only on the meaning embedding (which
+is frozen) and the val .bin files (which already exist).
+
+### Setup
+
+`scripts/train_domain_classifier.py`. Window of 512 tokens, EMA over
+meaning vectors with α=0.05 (~20-token effective horizon), 132 → 64
+→ 2 MLP, 30 epochs, AdamW. Trained on val .bin files only (held-out
+from training data; classifier never sees what the experts saw).
+
+  • pg19: 599 windows
+  • wiki: 929 windows
+  • train 1223, val 305 (80/20 split)
+
+### Results
+
+| metric                     | value     |
+|----------------------------|----------:|
+| held-out accuracy          | **98.69%** |
+| pg19 per-class acc         |    99.15% |
+| wiki per-class acc         |    98.40% |
+| accuracy @ 16 tokens       |    91.30% |
+| accuracy @ 32 tokens       |    96.14% |
+| accuracy @ 64 tokens       |    98.04% |
+| accuracy @ 256 tokens      |    98.30% |
+| mean confidence margin     |     0.847 |
+| frac high-conf (margin>0.9)|     57.0% |
+| p50 margin                 |     0.935 |
+
+### What this answers
+
+The most uncertain part of the routing thesis was: do the frozen
+132-axis Qwen-contextual meaning vectors actually encode *domain*
+signal between two corpora that are both descriptive prose? Pg19 is
+literary, wiki is encyclopedic — different in style and register,
+not in surface syntax. If the axes mostly encode HAPPY / ANIMATE /
+PAST_TENSE etc. without register, the classifier should top out
+~70%.
+
+It hits 98.69% — the axes have far more domain signal than I'd
+calibrated. Possible explanations: (a) the production Qwen-coder
+model was trained on data that gave its contextual embedding strong
+register-awareness; (b) lexical density differs enough that even
+register-naïve features separate the corpora; (c) both.
+
+### What this implies
+
+  • **Routing converges fast in real generation**. 91% accuracy at
+    just 16 tokens means the outer router locks in within a sentence.
+    For the chatbot, 50+ token prompts give effectively perfect
+    routing.
+  • **Routing is sticky**. 98%+ accuracy on 512-token windows means
+    neighboring tokens overwhelmingly route to the same expert.
+    "Switch every other token" failure mode that would kill LAN
+    distribution doesn't happen at this corpus separation.
+  • **The binary case is the hard one**. Pg19/wiki are closest
+    semantically of the four corpora I prepped. Adding tool (JSON)
+    and code (Python) — syntactically distinguishable in 2-3 tokens —
+    should hit ≥99% trivially.
+
+### Next gate
+
+Wait for training (now ~step 7000+, both runs alive). Then:
+  1. Cross-domain val matrix: pg19_expert × wiki_val, wiki_expert ×
+     pg19_val. If `wiki_expert(wiki_val) > pg19_expert(wiki_val)` and
+     symmetrically, **specialization is real** (the gap, not the
+     absolute, decides the swarm thesis).
+  2. Oracle-routing stitch: ground-truth-route a mixed text, see if
+     the alternation produces coherent output. Isolates "do experts
+     compose" from "can we route".
+  3. Learned-routing stitch: same text but with the classifier from
+     today driving routing decisions.
+
+Saved: `data/domain_classifier_pg19_wiki.pt` (~10 KB).
+
+---
+
+## 2026-04-30 17:35 — v6 mid-run gate (step 5000 / 10 000)
+
+Both runs healthy at the halfway mark. No plateau, LR still at
+cosine-decayed 2.5e-4, throughput steady ~40 K tok/s on each 4060 Ti.
+
+### Val trajectory (every 250 steps, only first val + key milestones)
+
+| step | PG-19 val | PG-19 PPL | Wiki val | Wiki PPL |
+|-----:|----------:|----------:|---------:|---------:|
+|  250 |    6.6729 |       790 |   6.4113 |      609 |
+|  500 |    5.7577 |       316 |   5.5014 |      245 |
+| 1000 |    5.3745 |       216 |   5.0770 |      160 |
+| 2000 |    4.9216 |       137 |   4.5085 |       91 |
+| 3000 |    4.7613 |       117 |   4.3046 |       74 |
+| 4000 |    4.6997 |       110 |   4.2183 |       68 |
+| 5000 |    4.5591 |        96 |   4.1296 |       62 |
+
+Wiki already crossed into the band I'd called "good at 10K" (4.2-4.7
+val). PG-19 at the upper edge of its band (4.5-5.0). Expectation
+revised upward — both should land below the bands by step 10 K.
+
+### Slope analysis
+
+PG-19 last 3 val deltas: -0.06, -0.09, -0.14, -0.03, -0.14
+Wiki  last 3 val deltas: -0.09, -0.07, -0.09, -0.01, -0.09
+
+Wiki slope flattening more than PG-19's — Wiki may be approaching its
+bf16 floor for this 200 MB / ~5-epoch budget. PG-19 still has room
+(literary text has more entropy per token, longer to learn).
+
+### Why this is encouraging beyond the numbers
+
+  • Unified vocab is **not** hurting either corpus. Was a real risk:
+    the 32K Qwen vocab includes ~30% pure code tokens that wiki/pg19
+    never see, which could waste embedding capacity. It doesn't.
+  • Ratio Wiki/PG-19 (62 / 96 = 0.65) is consistent with what bigger
+    models show on the same corpora — confirms PG-19 is genuinely
+    harder, not that we're doing anything wrong on it.
+  • No divergence, no NaN, no spikes. M+I + HetMoE handles harder
+    text without the recipe changes that v5b needed for TinyStories.
+
+### Next gate
+
+Wait for completion (~25 min). Then:
+  1. Eval both on each other's val (cross-domain). If pg19-expert is
+     meaningfully worse on wiki than wiki-expert is on wiki — and
+     symmetrically — specialization is real. That's the signal we
+     need for the hierarchical-MoE thesis.
+  2. Train 132→64→2 classifier on EMA of meaning vectors over the two
+     domains. Measure routing stickiness on a mixed-text held-out.
+  3. If both pass: kick off tool + code expert training. If they
+     don't, debug specialization (might be that the domains aren't
+     different enough at this scale).
+
+---
+
+## 2026-04-30 17:00 — v6 unified vocab dataprep done; PG-19 + Wiki training launched
+
+Building the foundation for hierarchical HetMoE. Dropped TinyStories
+(its vocab is a strict subset of PG-19, would give the per-token outer
+router redundant domains) and standardised on 4 mutually-distinct
+corpora, all sharing one trimmed Qwen2.5 vocab so domain experts can
+be added later without re-tokenizing or re-training.
+
+### Corpora (200 MB raw text each, streamed)
+
+| corpus | source                     | tokens (train) | unk%  |
+|--------|----------------------------|---------------:|------:|
+| pg19   | emozilla/pg19 (parquet)    |     49,260,164 | 2.21  |
+| wiki   | Salesforce/wikitext-103    |     46,018,387 | 3.24  |
+| tool   | glaiveai func-calling-v2   |     43,701,052 | 1.55  |
+| code   | bigcode/starcoderdata-py   |     49,455,287 | 5.60  |
+
+Total ~187 M training tokens, ~2 M validation. `deepmind/pg19`
+script-format breaks newer `datasets` (gzip-as-utf-8 decode error);
+`emozilla/pg19` parquet mirror works.
+
+### Vocab tuning
+
+First run at MAX_VOCAB=24576 hit the cap (99.50% coverage of union)
+and left code at 8.08% unk. Inspecting the dropped tokens showed real
+Python subwords (`protobuf`, `_listener`, `(handler`, `Assignment`,
+`_pending`) — not garbage. Bumped to **MAX_VOCAB=32768**: same 99.50%
+union coverage but per-corpus unk dropped to 5.6% (code), 3.2% (wiki),
+2.2% (pg19), 1.5% (tool). uint16-safe and only +14 M params on
+embedding.
+
+### Meaning axes
+
+`scripts/make_unified_meaning_axes.py` against the production Qwen
+contextual file: 100% direct lookup (32 764 of 32 764 non-special
+tokens have non-zero rows in the production file), zero fallback
+needed. Mean meaning-vector norm 8.80 — healthy.
+
+### Smoke + parallel launch
+
+50-step smoke on PG-19 GPU 0: loss 10.06 → 7.88, 43 K tok/s, 4.9 GB
+mem on a 16 GB 4060 Ti. **Total params 51.97 M** — was 38 M at
+vocab=16 K; the +14 M is purely the bigger embedding matrix.
+
+Launched the real runs in parallel:
+
+  • PG-19 → GPU 0, seed 1337, 10 000 steps (config `tiny_hetmoe_v6_pg19.json`)
+  • Wiki  → GPU 1, seed 2025, 10 000 steps (config `tiny_hetmoe_v6_wiki.json`)
+
+Same architecture as v5b (264/528, L=4, H=4, E=4 top-2). Pure bf16,
+QAT off — this is a sanity-check for the unified vocab + harder
+corpora. ETA ~50 min wall each. Outputs `runs/tiny_hetmoe_v6_pg19/`
+and `runs/tiny_hetmoe_v6_wiki/`.
+
+### Why this matters
+
+This is the data foundation for the chatbot product:
+1. PG-19 + Wiki experts trained now (this gate)
+2. If their loss curves look reasonable and a 132→64→4 classifier on
+   EMA-meaning vectors can route between them, we extend to
+   {tool, code} → 4 domain experts
+3. Outer per-token router selects which whole-HetMoE expert generates
+   the next token; inner HetMoE routing handles architecture-level
+   experts as before (M+I + Highway + 4 het experts top-2)
+
+Doing it now with all 4 corpora baked into the vocab so we never have
+to retokenize/retrain when adding the 3rd and 4th experts.
+
+---
+
 ## 2026-04-30 16:00 — v5b extrapolation evaluation
 
 Ran proper long-context evaluation on v5b's bf16 best (1.6056) and

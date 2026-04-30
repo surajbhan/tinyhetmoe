@@ -1,0 +1,62 @@
+{
+  "run_name": "tiny_hetmoe_v6_5_wiki",
+  "out_dir": "runs/tiny_hetmoe_v6_5_wiki",
+  "resume_from": "",
+
+  "vocab_size": 32768,
+  "meaning_dim": 132,
+  "intuition_dim": 132,
+  "input_dim": 264,
+  "internal_dim": 528,
+  "new_intuition": 264,
+  "num_layers": 4,
+  "num_heads": 4,
+  "num_experts": 4,
+  "top_k_experts": 2,
+  "ffn_mult": 2.0,
+  "max_seq_len": 2048,
+  "load_balance_weight": 0.01,
+
+  "train_file": "data/unified_train_wiki.bin",
+  "val_file": "data/unified_val_wiki.bin",
+  "meaning_emb_path": "data/unified_meaning_axes_132.npy",
+
+  "seq_len": 512,
+  "micro_batch": 16,
+  "grad_accum": 2,
+
+  "var_lengths": [
+    {"seq_len": 256,  "micro_batch": 32, "weight": 0.25},
+    {"seq_len": 512,  "micro_batch": 16, "weight": 0.40},
+    {"seq_len": 1024, "micro_batch": 8,  "weight": 0.25},
+    {"seq_len": 2048, "micro_batch": 4,  "weight": 0.10}
+  ],
+
+  "max_steps": 30000,
+  "warmup_steps": 500,
+  "lr": 0.0003,
+  "min_lr": 0.0002,
+  "weight_decay": 0.01,
+  "max_grad_norm": 1.0,
+
+  "log_interval": 100,
+  "val_interval": 500,
+  "save_interval": 2000,
+  "val_seqs": 50,
+  "keep_recent_ckpts": 2,
+  "seed": 2025,
+  "dtype": "bf16",
+
+  "lr_plateau_patience": 8,
+  "lr_floor": 1e-05,
+  "lr_decay_factor": 0.5,
+
+  "freeze_meaning": false,
+
+  "qat_from_zero": false,
+  "qat_start_step": 0,
+  "qat_on_plateau": true,
+  "qat_backward_mode": "ste",
+
+  "gpu_resident_corpus": true
+}

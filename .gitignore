@@ -4,9 +4,17 @@
 runs/
 logs/
 
-# Tokenized corpus (regenerate via scripts/prepare_data.py).
-data/train.bin
-data/val.bin
+# Tokenized corpora, per-token embeddings, and intermediate artifacts.
+# All regeneratable from scripts/{prepare_data*,make_*meaning_axes,
+# build_tool_corpus,tokenize_tool_corpus,patch_vocab_for_chatml,
+# train_domain_classifier}.py.
+data/*.bin
+data/*.npy
+data/*.bak
+data/*.bak.bin
+data/tool_corpus_chatml.txt
+data/tool_corpus_stats.json
+data/domain_classifier_*.pt
 
 # Old path (pre-rename to docs/) — gitignore for safety
 ui/tiny.bin

@@ -101,6 +101,12 @@ fn attention_step(
     kv.append(layer_idx, &scratch.k[..dim], &scratch.v[..dim]);
     let seq_len = pos + 1;
 
+    // Grow scores buffer if we've exceeded max_seq_len (NoPE means there's
+    // no positional limit on the model itself; just our static buffer).
+    if scratch.scores.len() < seq_len {
+        scratch.scores.resize(seq_len, 0.0);
+    }
+
     for o in scratch.attn_out[..dim].iter_mut() { *o = 0.0; }
 
     let scale = 1.0 / (head_dim as f32).sqrt();

@@ -5,6 +5,116 @@ each gate (not just end-of-day). New entries on top.
 
 ---
 
+## 2026-04-30 11:25 — v4a stopped, v5 launched with var-length training
+
+### v4a final result
+
+QAT-best val **1.5734 / PPL 4.82** at step 38500. Stopped early because:
+- Long-context test confirmed v4a collapses past seq_len=512 (training cap).
+  PPL 6.1 in-range → PPL 38 at 1024 → PPL 237 at 2048 → PPL 405 at 3072.
+  No amount of further training at fixed length 512 will fix that.
+- v5 with variable-length training is the actual fix.
+
+`docs/tiny.bin` updated to v4a's final best_qat (PPL 4.82, was 4.94).
+
+### v5 plan: var-length from scratch
+
+Trainer extended with `var_lengths` config (ported from production
+Highway-B). Per-step sample one of:
+- 256 × 32 (weight 0.25)
+- 512 × 16 (weight 0.40) — primary
+- 1024 × 8 (weight 0.25)
+- 2048 × 4 (weight 0.10)
+
+Plus full v4a recipe:
+- STE backward (production 130M default; we validated this beats
+  vote-backward at our scale)
+- min_lr=2e-4 (production-aligned)
+- plateau-trigger QAT
+- max_seq_len bumped to 2048 in config
+- 60K steps (~6h wall, ~2× v4a's wall time due to longer sequences)
+
+### Why fresh from scratch
+
+Resuming v4a's bf16 best (which was trained at 512) would propagate the
+fixed-length attention statistics it learned. Cleaner to start from
+init and let var-length shape attention from the start.
+
+### Checkpoint registry
+
+Added `CHECKPOINTS.md` listing named snapshots so we don't lose track
+across runs. v4a best_qat is preserved at `/tmp/v4a_best_qat.pt`.
+
+---
+
+## 2026-04-30 09:43 — Trainer fix: save best_qat.pt separately
+
+Caught an important bug while v4a was running: with bf16-then-QAT, the
+trainer's `best.pt` always lands on the bf16 phase since bf16's val is
+always lower than QAT's. **The QAT-mode best — what we actually deploy
+to docs/tiny.bin — was never being saved as a single canonical file.**
+
+Fix: track `best_qat_val` separately from `best_val`. Save
+`best_qat.pt` whenever `qat_currently_on AND vloss < best_qat_val`.
+Also fix plateau detector to compare against the phase-appropriate
+best (in QAT phase, compare against best_qat_val so the detector
+doesn't freeze at the bf16 floor).
+
+Stopped v4a at step ~27000, fixed the trainer, resumed from
+`ckpt_27000.pt`. v4a state is preserved (QAT mode active, optimizer
+restored). Next val will produce the first `best_qat.pt`.
+
+---
+
+## 2026-04-30 09:20 — v4a launched: STE backward (production 130M default)
+
+### Why STE not vote-backward
+
+User pointed out that the production runs that "recovered in 4 vals
+after QAT switch" were the **2B-scale** ones — which use very aggressive
+integer routing (`go.sign() × sign(w_ternary)` then `.sign()` the
+final gradient). The smaller production runs (130M PoC, qat_qwen35,
+autoresearch 130M) all use **plain STE** (`return grad_output`).
+
+We've been using vote-backward (`grad × sign(w)` with 0.1× zero rescue)
+at 38M scale — neither of the two recipes that work in production.
+That's likely why our QAT plateaus at PPL 11 instead of recovering to
+the bf16 floor.
+
+### v4 plan: A/B between STE and aggressive sign-routing
+
+- **v4a (STE):** plain straight-through. 130M production default.
+  Expected to recover to bf16 floor. Running now.
+- **v4b (vote_sign):** if v4a doesn't recover, try 2B-style aggressive
+  — sign(grad) × sign(w), final result quantized to ±1.
+
+Also added `qat_backward_mode` config field to model + trainer so we
+can A/B without code changes.
+
+### v4a config
+
+[`training/configs/tiny_hetmoe_v4a_ste.json`](training/configs/tiny_hetmoe_v4a_ste.json)
+- Resume: v3 bf16 best (step 24000, val 1.5155)
+- `qat_backward_mode: "ste"`
+- `qat_start_step: 24050` (50 bf16 prime steps after resume, then QAT)
+- `min_lr: 2e-4` (validated good in v3)
+- `val_interval: 250` (so we measure recovery faster — production "4 vals" = 1000 steps)
+- `max_steps: 40000` (16K post-QAT)
+
+### Smoke test result (encouraging)
+
+30 steps after QAT switch: val 2.98 (already below v3's plateau of 2.55+).
+Loss descending fast: 5.74 → 4.49 → 3.91 → 3.58 → 3.30 → 3.20 (50 steps).
+v3 with vote-backward at the same wall-time was at loss 4.5+.
+
+### v3 ship in the meantime
+
+v3 model already shipped at https://surajbhan.github.io/tinyhetmoe/
+(15 MB packed HTMOE003). Demo is live. v4 will replace it if it
+beats v3's QAT floor of 2.45.
+
+---
+
 ## 2026-04-30 01:00 — v3 launched: min_lr fix after diagnosing v2
 
 ### v2 outcome

@@ -48,7 +48,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from model.tiny_hetmoe import (  # noqa: E402
-    TinyHetMoE, TinyHetMoEConfig, set_quantize_mode,
+    TinyHetMoE, TinyHetMoEConfig, set_quantize_mode, set_qat_backward_mode,
 )
 
 
@@ -90,6 +90,16 @@ class TrainCfg:
     seq_len: int = 512
     micro_batch: int = 16
     grad_accum: int = 2
+
+    # Variable-length training. If non-empty, each optimizer step samples
+    # one (seq_len, micro_batch) from this list by weight. Critical for
+    # long-context extrapolation since NoPE alone collapses past the
+    # fixed training length. Production Highway-B uses this. Example:
+    #   [{"seq_len": 256, "micro_batch": 24, "weight": 0.3},
+    #    {"seq_len": 512, "micro_batch": 12, "weight": 0.4},
+    #    {"seq_len": 1024, "micro_batch": 6, "weight": 0.3}]
+    # When empty, falls back to fixed seq_len/micro_batch above.
+    var_lengths: list = field(default_factory=list)
     max_steps: int = 60000
     warmup_steps: int = 1000
     lr: float = 3e-4
@@ -114,6 +124,12 @@ class TrainCfg:
     # Recipe knobs
     freeze_meaning: bool = False     # B = trainable. Default False.
     qat_from_zero: bool = True
+
+    # Backward mode for the ternary autograd function. Production findings:
+    #   - "ste"       (production 130M PoC default; recommended for ≤200M scale)
+    #   - "vote"      (our v1-v3; grad × sign(w) with 0.1× zero rescue)
+    #   - "vote_sign" (production 2B; aggressive integer routing — recovered in 4 vals)
+    qat_backward_mode: str = "ste"
 
     # bf16-then-QAT scheduling. When `qat_start_step > 0`, model trains
     # in FP for [0, qat_start_step) and switches to ternary for the
@@ -174,8 +190,11 @@ class TinyStoriesDataset:
             self.n_tokens = len(self.cpu_data)
             self.gpu_data = None
 
-    def sample_batch(self, batch_size: int):
-        max_start = self.n_tokens - self.seq_len - 2
+    def sample_batch(self, batch_size: int, seq_len: int | None = None):
+        # Variable-length training: caller may override seq_len per step.
+        # Falls back to construction-time seq_len if not specified.
+        sl = seq_len if seq_len is not None else self.seq_len
+        max_start = self.n_tokens - sl - 2
         # Generate batch_size random start positions
         starts = self.rng.integers(0, max_start, size=batch_size)
 
@@ -183,7 +202,7 @@ class TinyStoriesDataset:
             # GPU-resident path: gather batch_size windows directly on GPU.
             # Build an index tensor (B, T+1) of absolute positions, then
             # gather. Index tensor is built on CPU then transferred (small).
-            offsets = torch.arange(self.seq_len + 1, dtype=torch.long)  # (T+1,)
+            offsets = torch.arange(sl + 1, dtype=torch.long)  # (T+1,)
             starts_t = torch.from_numpy(starts).long()                   # (B,)
             idx = starts_t.unsqueeze(1) + offsets.unsqueeze(0)            # (B, T+1)
             idx = idx.to(self.gpu_device, non_blocking=True)
@@ -195,7 +214,7 @@ class TinyStoriesDataset:
         tgt_list = []
         for s in starts:
             chunk = np.asarray(
-                self.cpu_data[int(s):int(s) + self.seq_len + 1], dtype=np.int64,
+                self.cpu_data[int(s):int(s) + sl + 1], dtype=np.int64,
             )
             ids_list.append(chunk[:-1])
             tgt_list.append(chunk[1:])
@@ -318,6 +337,10 @@ def main():
               flush=True)
         print(f"[tiny] QAT from zero: {tcfg.qat_from_zero}", flush=True)
 
+    set_qat_backward_mode(tcfg.qat_backward_mode)
+    if is_main:
+        print(f"[tiny] QAT backward mode: {tcfg.qat_backward_mode}", flush=True)
+
     model = TinyHetMoE(mcfg)
     model.load_meaning_embeddings(resolve(tcfg.meaning_emb_path),
                                    freeze=tcfg.freeze_meaning)
@@ -332,6 +355,11 @@ def main():
     # ── Resume ──
     start_step = 0
     best_val = float("inf")
+    # QAT-mode best is tracked separately. With bf16-then-QAT, bf16's
+    # val numbers are always lower than QAT's (FP > ternary capacity),
+    # so `best.pt` always lands on bf16 and we never save the actual
+    # ternary deployment artifact. `best_qat.pt` fixes this.
+    best_qat_val = float("inf")
     resume_lr_scale = 1.0
     resume_state = None
     if tcfg.resume_from:
@@ -348,6 +376,7 @@ def main():
                 print(f"[tiny] unexpected keys: {unexpected[:3]}", flush=True)
             start_step = int(resume_state.get("step", 0))
             best_val = float(resume_state.get("best_val", float("inf")))
+            best_qat_val = float(resume_state.get("best_qat_val", float("inf")))
             resume_lr_scale = float(resume_state.get("lr_scale", 1.0))
             if is_main:
                 print(f"[tiny] resumed step {start_step}, best_val "
@@ -443,6 +472,29 @@ def main():
     # is configured; consumed at the top of the next iteration.
     qat_trigger_pending = False
 
+    # Variable-length training setup. If `var_lengths` is configured, each
+    # optimizer step samples one (seq_len, micro_batch) pair from the list
+    # by weight. Critical for long-context extrapolation. Falls back to
+    # fixed (tcfg.seq_len, tcfg.micro_batch) if var_lengths is empty.
+    if tcfg.var_lengths:
+        var_lens = tcfg.var_lengths
+        var_len_weights = np.array([v["weight"] for v in var_lens], dtype=np.float64)
+        var_len_weights = var_len_weights / var_len_weights.sum()
+        if is_main:
+            print(f"[tiny] variable-length training:", flush=True)
+            for v, w in zip(var_lens, var_len_weights):
+                print(f"        seq_len={v['seq_len']:>5}  "
+                      f"micro_batch={v['micro_batch']}  weight={w:.3f}",
+                      flush=True)
+    else:
+        var_lens = [{"seq_len": tcfg.seq_len, "micro_batch": tcfg.micro_batch,
+                     "weight": 1.0}]
+        var_len_weights = np.array([1.0])
+        if is_main:
+            print(f"[tiny] fixed-length training: seq_len={tcfg.seq_len}, "
+                  f"micro_batch={tcfg.micro_batch}", flush=True)
+    var_len_rng = np.random.default_rng(tcfg.seed + local_rank * 1000 + 7)
+
     def enable_qat(reason: str):
         nonlocal qat_currently_on
         n_qat = set_quantize_mode(unwrapped, on=True)
@@ -478,10 +530,16 @@ def main():
                     val_history = []
                 qat_trigger_pending = False
 
+        # Pick a (seq_len, micro_batch) pair for this entire optimizer step.
+        var_idx = int(var_len_rng.choice(len(var_lens), p=var_len_weights))
+        v = var_lens[var_idx]
+        current_seq_len = v["seq_len"]
+        current_micro_batch = v["micro_batch"]
+
         loss_sum_for_step = 0.0
         nan_seen = False
         for _ in range(tcfg.grad_accum):
-            ids, tgt = train_ds.sample_batch(tcfg.micro_batch)
+            ids, tgt = train_ds.sample_batch(current_micro_batch, seq_len=current_seq_len)
             ids = ids.to(device, non_blocking=True)
             tgt = tgt.to(device, non_blocking=True)
             with torch.autocast("cuda", dtype=dtype,
@@ -514,7 +572,7 @@ def main():
         ema_loss = li if ema_loss is None else 0.98 * ema_loss + 0.02 * li
 
         if is_main and step % tcfg.log_interval == 0:
-            toks_per_step = (tcfg.micro_batch * tcfg.seq_len *
+            toks_per_step = (current_micro_batch * current_seq_len *
                               tcfg.grad_accum * world_size)
             dt_step = (time.time() - t_start) / max(1, step - start_step)
             tok_s = toks_per_step / dt_step if dt_step else 0
@@ -544,17 +602,46 @@ def main():
                 log_f.flush()
                 val_history.append((step, vloss))
 
+                # When in QAT phase, plateau detection compares against
+                # the QAT-best, not the lifetime best (bf16's val is
+                # always lower and would freeze the detector). Track which
+                # one we're comparing against:
+                phase_best = best_qat_val if qat_currently_on else best_val
+                beat_phase_best = vloss < phase_best
+
+                # Always-on best.pt (lowest val ever). For bf16-then-QAT
+                # this lands on the bf16 phase since bf16 vals < QAT vals.
                 if vloss < best_val:
                     best_val = vloss
                     torch.save({
                         "model": unwrapped.state_dict(),
                         "optimizer": opt.state_dict(),
                         "step": step, "best_val": best_val,
+                        "best_qat_val": best_qat_val,
                         "config": {**asdict(mcfg), **asdict(tcfg)},
                         "lr_scale": current_lr_scale,
                     }, out_dir / "checkpoints" / "best.pt")
                     print(f"  saved best.pt (val={best_val:.4f}, "
                           f"lr_scale={current_lr_scale:.3f})", flush=True)
+
+                # QAT-mode best — saved separately while QAT is on.
+                # This is the ternary deployment artifact.
+                if qat_currently_on and vloss < best_qat_val:
+                    best_qat_val = vloss
+                    torch.save({
+                        "model": unwrapped.state_dict(),
+                        "optimizer": opt.state_dict(),
+                        "step": step, "best_val": best_val,
+                        "best_qat_val": best_qat_val,
+                        "config": {**asdict(mcfg), **asdict(tcfg)},
+                        "lr_scale": current_lr_scale,
+                    }, out_dir / "checkpoints" / "best_qat.pt")
+                    print(f"  saved best_qat.pt (val={best_qat_val:.4f}, "
+                          f"PPL {math.exp(best_qat_val):.2f}) ←★ deployment artifact",
+                          flush=True)
+
+                # Plateau detection — uses phase-appropriate best.
+                if beat_phase_best:
                     val_history = [(step, vloss)]
                 else:
                     if len(val_history) >= tcfg.lr_plateau_patience + 1:

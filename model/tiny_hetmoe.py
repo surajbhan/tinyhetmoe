@@ -58,11 +58,37 @@ class TinyHetMoEConfig:
 # Ternary QAT
 # ============================================================================
 
+# Backward mode for TernaryQuantizeFn. Set via set_qat_backward_mode().
+#   "ste"        — straight-through estimator (return grad unchanged).
+#                  Production 130M PoC and qat_qwen35 use this. Best for <200M scale.
+#   "vote"       — vote-backward: grad × sign(w), 0.1× rescue at zero.
+#                  Production 1.5B/2B use this with extra sign() quantization.
+#   "vote_sign"  — 2B-style aggressive: sign(grad) × sign(w), then sign() the final
+#                  weight gradient. Pure integer routing. Used in production 2B
+#                  where it recovered in 4 vals after QAT switch.
+_QAT_BACKWARD_MODE = "ste"
+
+
+def set_qat_backward_mode(mode: str):
+    """Choose how TernaryQuantizeFn.backward computes the weight gradient.
+    Call before training starts. Affects every QuantizedLinear in the model."""
+    global _QAT_BACKWARD_MODE
+    assert mode in ("ste", "vote", "vote_sign"), f"unknown mode: {mode}"
+    _QAT_BACKWARD_MODE = mode
+
+
+def get_qat_backward_mode() -> str:
+    return _QAT_BACKWARD_MODE
+
+
 class TernaryQuantizeFn(torch.autograd.Function):
     """Forward: w_q = round(w/alpha).clamp(-1,1) * alpha, alpha=mean(|w|).
-    Backward: vote-backward — grad = grad_out * sign(w), with 0.1× rescue
-    at w=0. Learned to converge in production at 130M-1.5B; we apply the
-    same recipe at 26M."""
+
+    Backward depends on `_QAT_BACKWARD_MODE` (set globally before training):
+    - "ste":       grad pass-through (production 130M default)
+    - "vote":      grad × sign(w), 0.1× rescue at w=0 (our v1-v3)
+    - "vote_sign": sign(grad) × sign(w), result quantized to ±1 (production 2B)
+    """
 
     @staticmethod
     def forward(ctx, w):
@@ -77,11 +103,29 @@ class TernaryQuantizeFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         (w,) = ctx.saved_tensors
-        w_sign = torch.sign(w)
-        zero_mask = (w_sign == 0)
-        grad_w = grad_output * w_sign
-        grad_w = torch.where(zero_mask, grad_output * 0.1, grad_w)
-        return grad_w
+        mode = _QAT_BACKWARD_MODE
+
+        if mode == "ste":
+            return grad_output
+
+        if mode == "vote":
+            w_sign = torch.sign(w)
+            zero_mask = (w_sign == 0)
+            grad_w = grad_output * w_sign
+            grad_w = torch.where(zero_mask, grad_output * 0.1, grad_w)
+            return grad_w
+
+        if mode == "vote_sign":
+            w_sign = torch.sign(w)
+            zero_mask = (w_sign == 0)
+            # Aggressive: take sign of grad first, then route by w_sign
+            g_sign = torch.sign(grad_output)
+            grad_w = g_sign * w_sign
+            grad_w = torch.where(zero_mask, g_sign * 0.1, grad_w)
+            # Final quantize gradient itself (2B production trick)
+            return torch.sign(grad_w)
+
+        raise RuntimeError(f"unknown backward mode: {mode}")
 
 
 def ternary_quantize(w):

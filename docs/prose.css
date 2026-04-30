@@ -1,0 +1,299 @@
+/* prose.css — blog + journal pages.
+ * Inherits palette from style.css; overrides the locked-viewport layout. */
+
+/* The blog/journal pages always scroll naturally — override the
+   desktop viewport-lock from style.css. */
+@media (min-width: 1101px) {
+  body.prose-page {
+    overflow: auto;
+    height: auto;
+    display: block;
+  }
+  html:has(body.prose-page) {
+    overflow: auto;
+    height: auto;
+  }
+}
+body.prose-page {
+  display: block;
+  padding: 14px 18px 80px;
+  max-width: none;
+}
+body.prose-page html { height: auto; overflow: auto; }
+
+.topbar h1 a {
+  color: var(--text);
+  text-decoration: none;
+}
+.topbar h1 a:hover { color: var(--accent); }
+.page-tag {
+  color: var(--text-faint);
+  font-weight: 400;
+  margin-left: 4px;
+  font-size: 14px;
+}
+.header-link {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px dashed var(--accent-border);
+}
+.header-link:hover { color: var(--accent-2); }
+.nav-chip {
+  text-decoration: none;
+  cursor: pointer;
+}
+.nav-chip:hover {
+  background: var(--accent-bg);
+  border-color: var(--accent-border);
+  color: var(--accent);
+}
+
+/* ── Main column ─────────────────────────────────────────────────── */
+.prose-main {
+  max-width: 760px;
+  margin: 16px auto 0;
+  position: relative;
+}
+.hidden { display: none !important; }
+.loading { color: var(--text-faint); font-style: italic; padding: 24px 0; }
+.error {
+  color: #d88080;
+  background: rgba(193, 69, 69, 0.1);
+  border: 1px solid #6a2828;
+  padding: 10px 14px;
+}
+
+/* ── Blog post list ──────────────────────────────────────────────── */
+.post-list {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 8px 0;
+}
+.post-card {
+  display: block;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  padding: 18px 22px;
+  cursor: pointer;
+  text-decoration: none;
+  color: inherit;
+  transition: background 0.1s, border-color 0.1s;
+}
+.post-card:hover {
+  background: var(--accent-bg);
+  border-color: var(--accent-border);
+}
+.post-card-date {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+}
+.post-card-title {
+  margin: 0 0 8px 0;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.3px;
+  color: var(--text);
+}
+.post-card:hover .post-card-title { color: var(--accent); }
+.post-card-summary {
+  margin: 0 0 8px 0;
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--text-dim);
+}
+.post-card-arrow {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* ── Post view ───────────────────────────────────────────────────── */
+.prose {
+  font-size: 15px;
+  line-height: 1.7;
+  color: var(--text);
+}
+
+.post-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 16px;
+  margin-bottom: 22px;
+  border-bottom: 1px solid var(--border);
+}
+.post-back {
+  color: var(--accent);
+  text-decoration: none;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.post-back:hover { color: var(--accent-2); }
+.post-date {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* ── Markdown body styling ───────────────────────────────────────── */
+.prose h1 {
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+  margin: 0 0 12px;
+  color: var(--text);
+}
+.prose h2 {
+  font-size: 19px;
+  font-weight: 600;
+  letter-spacing: -0.3px;
+  margin: 32px 0 8px;
+  color: var(--accent);
+  scroll-margin-top: 60px;
+}
+.prose h3 {
+  font-size: 16px;
+  font-weight: 600;
+  margin: 22px 0 6px;
+  color: var(--text);
+}
+.prose p {
+  margin: 0 0 14px;
+  color: var(--text);
+}
+.prose strong, .prose b { color: var(--accent); font-weight: 600; }
+.prose em { color: var(--text); font-style: italic; }
+.prose a {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px dashed var(--accent-border);
+}
+.prose a:hover { color: var(--accent-2); border-bottom-color: var(--accent-2); }
+.prose ul, .prose ol {
+  margin: 0 0 14px;
+  padding-left: 24px;
+}
+.prose li { margin: 4px 0; }
+.prose code {
+  font-family: var(--mono);
+  font-size: 13px;
+  background: var(--bg-input);
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 0;
+  color: var(--accent);
+}
+.prose pre {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  padding: 12px 14px;
+  overflow-x: auto;
+  margin: 0 0 16px;
+  line-height: 1.5;
+}
+.prose pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--text);
+  font-size: inherit;
+}
+.prose blockquote {
+  margin: 0 0 16px;
+  padding: 8px 16px;
+  border-left: 3px solid var(--accent);
+  background: var(--accent-bg);
+  color: var(--text-dim);
+  font-style: italic;
+}
+.prose blockquote p { margin: 0; }
+.prose blockquote p + p { margin-top: 8px; }
+.prose hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 32px 0;
+}
+.prose table {
+  border-collapse: collapse;
+  margin: 0 0 16px;
+  font-size: 13px;
+  width: 100%;
+}
+.prose th, .prose td {
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  text-align: left;
+}
+.prose th {
+  background: var(--bg-input);
+  color: var(--accent);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  font-size: 11px;
+}
+
+/* ── Floating TOC for journal ─────────────────────────────────────── */
+.toc {
+  display: none;
+}
+@media (min-width: 1300px) {
+  .toc {
+    display: block;
+    position: fixed;
+    top: 100px;
+    right: 24px;
+    width: 220px;
+    max-height: calc(100vh - 140px);
+    overflow-y: auto;
+    font-family: var(--mono);
+    font-size: 11px;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    padding: 12px 14px;
+    border-radius: 0;
+  }
+  .toc-title {
+    font-weight: 600;
+    color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 8px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  .toc ul {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+  .toc li { margin: 4px 0; }
+  .toc a {
+    color: var(--text-dim);
+    text-decoration: none;
+    display: block;
+    line-height: 1.35;
+  }
+  .toc a:hover { color: var(--accent); }
+}
+
+/* ── Mobile ──────────────────────────────────────────────────────── */
+@media (max-width: 600px) {
+  body.prose-page { padding: 8px 12px 60px; }
+  .prose-main { margin-top: 10px; }
+  .prose { font-size: 14.5px; line-height: 1.65; }
+  .post-card { padding: 14px 16px; }
+  .post-card-title { font-size: 17px; }
+  .prose h1 { font-size: 22px; }
+  .prose h2 { font-size: 17px; }
+}

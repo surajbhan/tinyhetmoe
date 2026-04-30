@@ -125,6 +125,17 @@ body {
   color: var(--accent);
   font-weight: 700;
 }
+.nav-link {
+  text-decoration: none;
+  cursor: pointer;
+  color: var(--text-dim);
+  transition: background 0.1s, border-color 0.1s, color 0.1s;
+}
+.nav-link:hover {
+  background: var(--accent-bg);
+  border-color: var(--accent-border);
+  color: var(--accent);
+}
 
 /* ── Grid layout (desktop) ───────────────────────────────────────── */
 .grid {

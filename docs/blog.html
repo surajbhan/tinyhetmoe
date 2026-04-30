@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#1a1612" />
+  <title>TinyHetMoE — Blog</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="prose.css" />
+</head>
+<body class="prose-page">
+  <header class="topbar">
+    <div class="topbar-left">
+      <h1><a href="./">TinyHetMoE<span class="logo-dot">.</span></a> <span class="page-tag">/ blog</span></h1>
+      <span class="subtitle">
+        Long-form notes on building the model. The
+        <a href="journal.html" class="header-link">journal</a> has the
+        chronological engineering log; this is the curated narrative.
+      </span>
+    </div>
+    <div class="topbar-right">
+      <a href="./" class="meta-chip nav-chip">← demo</a>
+      <a href="journal.html" class="meta-chip nav-chip">journal →</a>
+      <a href="https://github.com/surajbhan/tinyhetmoe" target="_blank" class="meta-chip nav-chip">github</a>
+    </div>
+  </header>
+
+  <main class="prose-main">
+    <div id="post-list" class="post-list">
+      <div class="loading">Loading posts…</div>
+    </div>
+    <article id="post-content" class="prose hidden"></article>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="prose.js"></script>
+  <script>
+    const POSTS = [
+      {
+        slug: "0-why-tinyhetmoe",
+        title: "Why TinyHetMoE",
+        date: "2026-04-29",
+        summary: "What this thing is and why it's worth a few hours of compute and a weekend of UI work."
+      },
+      {
+        slug: "1-getting-qat-to-converge",
+        title: "Getting ternary QAT to actually converge",
+        date: "2026-04-30",
+        summary: "Five tries, three independent bugs. STE vs vote-backward, min_lr floor, variable-length training."
+      },
+    ];
+    initBlog(POSTS);
+  </script>
+</body>
+</html>

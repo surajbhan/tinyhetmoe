@@ -1,21 +1,30 @@
 # TinyHetMoE Checkpoint Registry
 
-Manually-maintained list of meaningful checkpoints we don't want to lose.
-Stored outside the repo (in `/tmp/` or `/data/.../runs/`) since they're
-too large to commit.
+Manually-maintained list of meaningful checkpoints. Most snapshots live
+outside the repo (`/tmp/` or in `runs/`) since they're too large to commit.
 
-| Snapshot path | Run | Step | Type | val | PPL | Notes |
+## Current
+
+| Snapshot | Run | Step | Type | val | PPL | Notes |
 |---|---|---|---|---|---|---|
-| `/tmp/v2_bf16_best_step17000.pt` | v2 | 17000 | bf16 best | 1.5418 | 4.67 | First clean Eldan & Li-baseline bf16 floor |
-| `/tmp/v3_bf16_best_step24000.pt` | v3 | 24000 | bf16 best | 1.5155 | 4.55 | Improved bf16 floor with high min_lr |
-| `/tmp/v4a_best_qat.pt`           | v4a | 38500 | QAT best | 1.5734 | 4.82 | First QAT to nearly match bf16 (STE backward) |
-| `runs/tiny_hetmoe_v4a/checkpoints/best_qat.pt` | v4a | (live) | QAT best | (live) | (live) | Currently in v4a's run dir |
-| `runs/tiny_hetmoe_v4a/checkpoints/best.pt`     | v4a | (none yet) | — | — | — | Resume init had bf16=1.5155 from v3; never beaten in QAT mode |
+| `/tmp/v3_bf16_best_step24000.pt` | v3 | 24000 | bf16 | 1.5155 | 4.55 | bf16 floor — used to seed v4a |
+| `/tmp/v4a_best_qat.pt`           | v4a | 38500 | QAT | 1.5734 | 4.82 | **Currently deployed** to docs/tiny.bin |
+| `runs/tiny_hetmoe_v4a/checkpoints/best_qat.pt` | v4a | 38500 | QAT | 1.5734 | 4.82 | Same as above (in run dir) |
+| `runs/tiny_hetmoe_v4a/checkpoints/ckpt_final_40000.pt` | v4a | 40000 | QAT | — | — | End-of-run record |
+| `runs/tiny_hetmoe_v5/checkpoints/best.pt`     | v5 | (live) | bf16 | (live) | (live) | v5 in progress |
+| `runs/tiny_hetmoe_v5/checkpoints/best_qat.pt` | v5 | (pending) | QAT | — | — | Will save once QAT phase fires |
+
+## Deleted (to free disk)
+
+- `runs/tiny_hetmoe/` (v1, val 3.05 / PPL 21, QAT-from-zero with vote-backward — superseded)
+- `runs/tiny_hetmoe_v2/` (val 2.55 / PPL 12, QAT phase starved by low min_lr — superseded)
+- `runs/tiny_hetmoe_v3/` (val 2.40 / PPL 11, vote-backward at 38M scale was wrong choice — superseded)
+- v4a intermediate `ckpt_36-40K.pt` (kept only `best_qat.pt` and `ckpt_final_40000.pt`)
 
 ## Currently deployed
 
 `docs/tiny.bin` ← exported from `/tmp/v4a_best_qat.pt` (PPL 4.82).
-GitHub Pages serves this at https://surajbhan.github.io/tinyhetmoe/
+Live demo at https://surajbhan.github.io/tinyhetmoe/
 
 ## Re-export workflow
 
@@ -30,5 +39,4 @@ git push
 
 The trainer saves `best.pt` (lifetime lowest val — usually bf16 phase) AND
 `best_qat.pt` (lowest val while QAT was on). Always deploy `best_qat.pt`
-since `best.pt` may contain FP weights that lose information when
-post-quantized at export time.
+since that's the actual ternary deployment artifact.

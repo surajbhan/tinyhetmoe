@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#1a1612" />
+  <title>TinyHetMoE — Journal</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="prose.css" />
+</head>
+<body class="prose-page">
+  <header class="topbar">
+    <div class="topbar-left">
+      <h1><a href="./">TinyHetMoE<span class="logo-dot">.</span></a> <span class="page-tag">/ journal</span></h1>
+      <span class="subtitle">
+        Engineering log. Updated at every gate (not end-of-day).
+        The <a href="blog.html" class="header-link">blog</a> has the
+        cleaned-up narrative version of this material.
+      </span>
+    </div>
+    <div class="topbar-right">
+      <a href="./" class="meta-chip nav-chip">← demo</a>
+      <a href="blog.html" class="meta-chip nav-chip">blog</a>
+      <a href="https://github.com/surajbhan/tinyhetmoe/blob/main/JOURNAL.md" target="_blank" class="meta-chip nav-chip">source ↗</a>
+    </div>
+  </header>
+
+  <main class="prose-main">
+    <article id="post-content" class="prose">
+      <div class="loading">Loading journal…</div>
+    </article>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="prose.js"></script>
+  <script>
+    initJournal();
+  </script>
+</body>
+</html>

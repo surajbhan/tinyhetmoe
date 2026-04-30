@@ -715,10 +715,16 @@ function renderAttn() {
       row.forEach((a, j) => {
         const sq = document.createElement("span");
         sq.className = "attn-square";
-        const intensity = Math.min(1.0, a / max);
-        const r = Math.round(255 - 220 * intensity);
-        const g = Math.round(255 - 180 * intensity);
-        const b = Math.round(255 - 80 * intensity);
+        // Dark-theme colormap: black/very-dark at 0, accent orange at peak.
+        // Gamma curve (sqrt) so even low-attention positions show a hint
+        // of color — important because attention is usually very peaked
+        // and a linear scale would render most positions as featureless.
+        const linear = Math.min(1.0, a / max);
+        const intensity = Math.sqrt(linear);   // gamma 0.5 brightens lows
+        // Accent orange = (255, 107, 53). Background-input = (22, 18, 14).
+        const r = Math.round(22  + (255 - 22)  * intensity);
+        const g = Math.round(18  + (107 - 18)  * intensity);
+        const b = Math.round(14  + (53  - 14)  * intensity);
         sq.style.background = `rgb(${r},${g},${b})`;
         sq.title = `attn → "${history[j]?.str || j}" = ${(a * 100).toFixed(1)}%`;
         cell.appendChild(sq);

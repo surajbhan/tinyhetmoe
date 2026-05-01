@@ -1,0 +1,16 @@
+{
+  "name": "tiny_hetmoe_wasm",
+  "type": "module",
+  "description": "TinyHetMoE ternary inference engine — native Rust + WASM target",
+  "version": "0.1.0",
+  "files": [
+    "tiny_hetmoe_wasm_bg.wasm",
+    "tiny_hetmoe_wasm.js",
+    "tiny_hetmoe_wasm.d.ts"
+  ],
+  "main": "tiny_hetmoe_wasm.js",
+  "types": "tiny_hetmoe_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

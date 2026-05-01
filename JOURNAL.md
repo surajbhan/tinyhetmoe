@@ -5,6 +5,229 @@ each gate (not just end-of-day). New entries on top.
 
 ---
 
+## 2026-05-01 ~09:00 — Browser stitched demo working; honest assessment + v7 plan
+
+Wrapping up the v6.x cycle. Engineering deliverables are real and
+working; the *output quality* of the demo isn't where it needs to be
+to publish to a non-technical audience.
+
+### What's working end-to-end
+
+  - **Rust stitched-MoE engine** (`wasm/src/stitch.rs`): N expert
+    forward passes, frozen 132→K classifier, EMA-of-meaning, per-token
+    routing, lazy KV cold-cache warmup, force-route mode, sticky-
+    routing hysteresis (`switch_threshold` margin).
+  - **WASM bindings**: 102 KB wasm + 28 KB JS. Loads 4 experts in ~2.5s
+    in node. Per-token routing decisions surface to JS.
+  - **Qwen2.5 BPE encoder ported to JS**: byte-perfect against the
+    Python tokenizer (16/16 test cases). Real encode/decode in browser,
+    not predefined prompts.
+  - **Browser UI** (`docs/stitch.html` + `stitch.js`): text input,
+    routing controls (classifier/forced/each-expert), latency-sim
+    toggles (off/LAN-5ms/WAN-50ms/mobile-150ms), per-token color-coded
+    routing strip, live trace, stats.
+  - **lm_head fix for QAT**: training and deployment now produce the
+    same numbers. v5b-era "PPL 4.94" was actually PPL ~9 on TinyStories
+    in deployed mode; corrected in blog addendum.
+  - **`<unk>` masking**: tid 0 added to every expert's masked_tids in
+    stitch.json. Prevents the compounding-failure mode where one bad
+    `<unk>` in context led to more `<unk>`s downstream.
+
+### What's NOT working well enough to ship publicly
+
+  1. **Output quality**. The 4 v6 experts:
+
+     | expert | bf16 PPL | QAT PPL (deployed) |
+     |--------|---------:|-------------------:|
+     | pg19   | 51       | 96                 |
+     | wiki   | 30       | 70                 |
+     | tool   | 3.15     | 3.9                |
+     | code   | 11.1     | 23                 |
+
+     Tool is genuinely good — ChatML structured corpus has very low
+     entropy. The other three need either more data (current 1 GB →
+     2-4 GB) or more steps (30K → 60-100K) to land in the PPL 4-5 range
+     where outputs feel fluent rather than just structurally-correct.
+
+  2. **Domain choices are wrong for the swarm pitch**. Pg19 vs Wiki is
+     "two flavors of generic prose." Doesn't sell the swarm thesis.
+     The demo router can route correctly between them, but a viewer
+     thinks "so what?". The right structure (per user):
+
+     - General-purpose / instruct (default expert)
+     - Thinker (reasoning / chain-of-thought)
+     - Code (Python)
+     - Medical
+     - Legal
+     - JS / web
+
+     Each has a *clear specialization story* and produces obviously-
+     different outputs from a generalist. Tool-calling becomes a SFT
+     of the general expert, not its own expert — it's a *capability*,
+     not a *domain*.
+
+  3. **PG-19/Wiki classifier ambiguity**. Even with the filtered tool
+     classifier (99.26% held-out acc), short literary prompts route to
+     wiki, not pg19. Two prose styles are too close on the 132-axis
+     EMA at 9-token prompt lengths. Workaround for now is "type a
+     longer prompt"; real fix is the v7 corpus restructure.
+
+  4. **Tool expert needs ChatML scaffold**. A naive "What's the weather
+     in Tokyo?" prompt routed to tool produces drift, because tool was
+     trained on full ChatML conversations. Production tool-use always
+     applies a chat template client-side; the demo should too. Becomes
+     irrelevant after restructuring (tool is SFT on general).
+
+### v7 plan — concrete
+
+Goal: 6 well-trained experts where each has a clear identity, trained
+to PPL 4-5 on its domain, properly SFT'd for the instruct ones.
+
+  1. **Drop pg19 + wiki as separate experts.** Their content folds
+     into the general-purpose expert.
+  2. **Define new domain set + corpora**:
+     - `general`: Open-Orca/SlimOrca + HuggingFaceH4/ultrachat_200k
+       (instruct chat). 2-4 GB.
+     - `thinker`: open-r1/OpenR1-Math-Raw + microsoft/orca-math
+       (reasoning traces). 1-2 GB.
+     - `code_py`: starcoderdata Python (already have) + Evol-Instruct-
+       Code SFT pass. Bump to 2 GB raw.
+     - `code_js`: starcoderdata JavaScript subset. ~2 GB.
+     - `medical`: medalpaca/medical_meadow_medqa + PubMedQA + maybe
+       BioMistral corpus. 1-2 GB.
+     - `legal`: lex_glue + casehold + US Code text. 1-2 GB.
+  3. **Re-do the unified vocab** including all 6 corpora upfront —
+     same lesson as the tool/code expansion. Avoid having to retrain
+     for vocab changes later.
+  4. **Train each expert to PPL ≤ 5** target. With more data + more
+     steps, expecting wall time of ~15 hr per expert per 4060 Ti.
+     6 experts ≈ 45 hr with both GPUs in parallel. Multi-day commit.
+  5. **Per-domain SFT pass** for the four task-experts (general,
+     thinker, code, medical, legal) — 2-3K steps each on instruction-
+     formatted data in their domain. Tool-use SFT folded into general.
+  6. **Re-train classifier as 132→64→6** on filtered val data per
+     domain. Target ≥99% held-out across all 6.
+  7. **Engineering polish in parallel**:
+     - Streaming gzip download for .bin files (cut bundle ~50%)
+     - Auto-ChatML wrap for tool-mode prompts (after general+SFT setup)
+     - UI: per-expert default prompts, route-stats summary
+
+### What gets committed/published from v6.x
+
+This commit is the engineering scaffolding — Rust engine, wasm
+bindings, browser tokenizer, stitch bundle structure, encoder/decoder
+verification, classifier training, build-bundle scripts. The v6.x
+*models* in `docs/stitch_v66/` are technical demos but won't be
+linked from any blog post or shared publicly until v7 lands.
+
+The architecture work is sound. The model quality just isn't there
+yet to convince anyone who isn't already willing to be charitable.
+
+---
+
+## 2026-04-30 23:30 — v6.6 stitching demo: hierarchical-MoE thesis confirmed (deployed-honest)
+
+Both v6.6 QAT runs done with the bug-fixed model code. Padded both
+to vocab=32772 (with logit-mask on the 4 ChatML specials for prose
+experts). Then ran the full stitching demo (`scripts/stitch_demo_v66.py`)
+on real generation.
+
+### Cross-domain matrix (deployed-honest, lower=better)
+
+|              | pg19_val | wiki_val |
+|--------------|---------:|---------:|
+| pg19_expert  | **4.61** |   7.98   |
+| wiki_expert  |   9.68   | **4.29** |
+
+In-domain advantage:
+  - pg19: +5.07 nats (PPL ratio **158×**)
+  - wiki: +3.70 nats (PPL ratio **40×**)
+
+These are deployed-honest numbers (model() inference path with QAT on,
+matches what the Rust engine will produce). The earlier v6.5 buggy
+numbers showed +4.30 nats — the bug fix actually *strengthened* the
+specialization signal because both experts learned their domains
+better with the QAT-aware lm_head.
+
+### Domain classifier
+
+132→64→2 MLP on EMA of meaning vectors over 512-token windows from
+unified val:
+  - 5589 pg19 windows + 2443 wiki windows
+  - **99.81% held-out accuracy**
+  - Trained on the v6.5/6.6 unified val .bins (different from v6's
+    classifier which was 98.69% on the older vocab=16K data)
+
+The unified Qwen vocab gives the classifier slightly cleaner signal
+than the older mixed-tokenization setup.
+
+### Real-text generation under each routing policy
+
+For each of 4 prompts (2 literary, 2 encyclopedic), generated 60-token
+continuations under 4 routing modes:
+
+**Literary prompt: "The old wooden house at the edge of the meadow..."**
+
+  - **pg19_only** stays literary: *"a short wonder he was not in the
+    town, and he had been in the house..."*
+  - **wiki_only** drifts to wiki style mid-sentence: *"opened in 1948.
+    The building soon came to be the only building..."*
+  - **alternate-50** shows clean seam at token 25, both halves
+    coherent within their style
+  - **learned routing**: routed all-pg19 ✓ — classifier correctly
+    identified literary register
+
+**Encyclopedic prompt: "Mount Everest is the highest mountain..."**
+
+  - **pg19_only** confused-literary on wiki topic: *"the village of,
+    where the L. A. A. A."*
+  - **wiki_only**: wiki-style with numbers and km²
+  - **learned routing**: routed all-wiki ✓ — *"the 1 @,@ 83 @,@ 686
+    km2 ( 50 @.@ 6 mi )"*
+
+**Classifier called all 4 prompts correctly** (2 → pg19, 2 → wiki).
+Routes were sticky (all one expert, no mid-stream switching).
+
+### What this proves for the swarm thesis
+
+  1. Specialization is dominant at this scale (+5 nats means the
+     wrong expert is essentially mute on out-of-domain queries).
+  2. Experts compose architecturally — "alternate-50" continuation
+     produces structured output within each chunk, demonstrating the
+     hidden state representation is shared enough that swapping
+     expert weights mid-token still yields coherent local language.
+  3. The classifier's 99.81% accuracy means routing decisions are
+     virtually free — and sticky routing means cold-cache warmup
+     happens once per turn, not per token.
+  4. All numbers honest by construction (loss path = inference path
+     after the bug fix).
+
+### Files written this gate
+
+  - `scripts/stitch_demo_v66.py` — cross-domain matrix + classifier
+    training + 4-mode generation per prompt. Reusable; just expand
+    `models = [pg19, wiki]` to add tool/code experts.
+  - `scripts/pad_checkpoint_vocab.py` — vocab grow tool, used here
+    to pad pg19/wiki best_qat.pt from 32768→32772.
+  - `runs/tiny_hetmoe_v6_6_pg19_qat/checkpoints/best_qat_padded.pt`
+  - `runs/tiny_hetmoe_v6_6_wiki_qat/checkpoints/best_qat_padded.pt`
+    (the deployable artifacts for the wasm engine)
+
+### Next gates
+
+  1. **Tool + code training in flight** (GPU 0/1, ~2 hr each).
+     Tool corpus is the unified ChatML format (glaive+xLAM+Hermes).
+     When done, expand stitch_demo to 4 experts and retrain classifier
+     as 132→64→4.
+  2. **WASM dual-model engine + classifier-in-Rust** can start now —
+     architecture-wise we have everything needed for 2-expert routing.
+  3. **Per-token routing visualization** in the UI: show the route
+     decision strip beneath generated text, with confidence bar.
+  4. **Latency simulation toggles**: off / LAN-1ms / WAN-50ms — show
+     users what each distribution scenario feels like.
+
+---
+
 ## 2026-04-30 23:00 — Found and fixed a long-standing measurement bug (v5b numbers were wrong)
 
 While debugging vocab padding for the v6.5 → v6.6 rebuild, hit a model
@@ -48,10 +271,43 @@ PPL ~9, not 4.94. The blog post and journal entries that say "PPL
 
 ### Affects every TinyHetMoE QAT model we've trained
 
-v1–v5b all had this bug. v5b is the only one currently deployed
+v1–v6.5 all had this bug. v5b is the only one currently deployed
 (`docs/tiny.bin`), so it's the only one with a public correction
 needed. Future runs (v6.6+) use the fixed model code and will report
 numbers that match deployment.
+
+### And the bug gets worse with vocab size
+
+Re-measured v6.5 best_qat.pt the same way (`scripts/verify_v65_deployed.py`):
+
+| corpus | reported | actual deployed | gap |
+|--------|---------:|----------------:|----:|
+| pg19   |   4.1848 |       **7.5347** | +3.35 |
+| wiki   |   3.7471 |       **7.6855** | +3.94 |
+
+Where v5b's bug-induced gap was +0.6 nats (PPL 5 → 9, still working),
+v6.5's gap is +3.4 to +3.9 nats — **deployed PPL ~2000, basically
+broken**. The v6.5 best_qat.pt files would have been word-salad in
+the browser.
+
+Why the bug is so much worse at v6.5: vocab grew 5967 → 32768 (5.5×
+bigger lm_head, 5.5× more rounding error compound), and the
+distributions (PG-19, Wiki) are much harder than TinyStories so
+lm_head precision matters more.
+
+### v6.6 isn't a marginal improvement, it's a rescue
+
+Current v6.6 best_qat (still descending at step 28500-29000):
+
+| corpus | v6.5 deployed | v6.6 latest | improvement |
+|--------|--------------:|------------:|------------:|
+| pg19   |        7.5347 |     4.63    | **-2.90 nats** |
+| wiki   |        7.6855 |     4.32    | **-3.37 nats** |
+
+So the bug-fix isn't a paper-correction — it's the difference between
+shipping a broken model and shipping a working one. v6.5 best_qat.pt
+files are unusable as-is; v6.6 will be the first deployable
+hierarchical-MoE expert checkpoints.
 
 ### The fix
 

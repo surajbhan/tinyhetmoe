@@ -21,13 +21,18 @@ use std::io::{Cursor, Read};
 pub mod model;
 pub mod tensor;
 pub mod forward;
+pub mod stitch;
 
 pub use model::{Config, Model, ScratchBuffers, Layer, Expert, ExpertArch, KVCache};
 pub use tensor::PackedTernaryWeight;
 pub use forward::{forward_token_with_trace, TokenTrace};
+pub use stitch::{StitchedEngine, StitchExpert, DomainClassifier, StitchStep, RouteMode};
 
 #[cfg(feature = "wasm")]
 pub mod wasm_api;
+
+#[cfg(feature = "wasm")]
+pub mod wasm_api_stitch;
 
 /// Top-level model loader. Reads bytes (file contents in native, or
 /// JS-supplied ArrayBuffer in WASM) and returns a Model ready to infer.

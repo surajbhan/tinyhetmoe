@@ -133,6 +133,15 @@ def main():
                 del blob[k]
                 print(f"[pad]   stripped {k} (shape mismatch on resume)")
 
+        # Update saved config's vocab_size so downstream tooling
+        # (scripts/export_model.py, etc.) sees the real shape.
+        if "config" in blob and isinstance(blob["config"], dict):
+            old_v = blob["config"].get("vocab_size")
+            if old_v != args.new_vocab:
+                blob["config"]["vocab_size"] = args.new_vocab
+                print(f"[pad]   updated config.vocab_size: {old_v} -> "
+                      f"{args.new_vocab}")
+
     ckpt_out.parent.mkdir(parents=True, exist_ok=True)
     torch.save(blob, ckpt_out)
     print(f"[pad] wrote {ckpt_out} ({ckpt_out.stat().st_size/1e6:.1f} MB)")

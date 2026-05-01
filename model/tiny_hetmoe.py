@@ -478,8 +478,8 @@ class TinyHetMoE(nn.Module):
             w_lm = ternary_quantize(self.lm_head.weight)
         else:
             w_lm = self.lm_head.weight
-        h_flat = hidden.view(-1, hidden.size(-1))
-        t_flat = targets.view(-1)
+        h_flat = hidden.reshape(-1, hidden.size(-1))
+        t_flat = targets.reshape(-1)
         CHUNK = 1024
         total = 0.0
         count = 0

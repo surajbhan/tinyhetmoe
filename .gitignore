@@ -23,6 +23,15 @@ ui/tiny_v2.bin
 # serves the model directly. Re-export with:
 #   python3 scripts/export_model.py --ckpt <ckpt.pt> --out docs/tiny.bin
 
+# Stitch bundles — per-expert weights.
+#   .bin     — uncompressed, NOT committed (regenerate via build_stitch_bundle.py)
+#   .bin.gz  — gzipped for browser streaming, IS committed so the demo
+#              works directly off the GitHub Pages serve. The browser
+#              uses DecompressionStream("gzip") to inflate while loading.
+#   .meta.json — stats only, not load-bearing for the demo
+docs/stitch_*/*.bin
+docs/stitch_*/*.meta.json
+
 # ── Python ────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc

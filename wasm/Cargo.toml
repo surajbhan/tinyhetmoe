@@ -12,8 +12,19 @@ crate-type = ["cdylib", "rlib"]
 name = "tiny_hetmoe_native"
 path = "src/main.rs"
 
+[[bin]]
+name = "stitch_native"
+path = "src/bin/stitch_native.rs"
+required-features = ["native_cli"]
+
 [dependencies]
 byteorder = "1.5"
+
+# Native CLI driver (stitch_native, etc.) needs JSON parsing for the
+# stitch bundle. Keep these out of the wasm bundle by gating on the
+# 'native_cli' feature, which the [[bin]] sections imply via build flags.
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 # wasm-bindgen path is opt-in. To build native, just `cargo build --release`.
 # To build WASM, `cargo build --release --target wasm32-unknown-unknown --features wasm`.
@@ -21,8 +32,9 @@ wasm-bindgen = { version = "0.2", optional = true }
 js-sys = { version = "0.3", optional = true }
 
 [features]
-default = []
+default = ["native_cli"]
 wasm = ["dep:wasm-bindgen", "dep:js-sys"]
+native_cli = ["dep:serde", "dep:serde_json"]
 
 [profile.release]
 opt-level = 3
@@ -30,6 +42,9 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
 
 [profile.release.package."*"]
 opt-level = 3

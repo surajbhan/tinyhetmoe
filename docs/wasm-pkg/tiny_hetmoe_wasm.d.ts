@@ -47,12 +47,65 @@ export class WasmStep {
     readonly routing_flat: Float32Array;
 }
 
+/**
+ * One step's output, mirrored for JS consumption.
+ */
+export class WasmStitchStep {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    readonly chosen_expert: number;
+    readonly classifier_probs: Float32Array;
+    readonly confidence: number;
+    readonly logits: Float32Array;
+    readonly warmup_happened: boolean;
+    readonly warmup_tokens: number;
+}
+
+/**
+ * Stitched-engine handle exposed to JS.
+ */
+export class WasmStitchedEngine {
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Force routing to a specific expert idx for subsequent step() calls.
+     * Pass -1 (or any negative value) to release back to classifier mode.
+     */
+    force_expert(idx: number): void;
+    /**
+     * Construct from N expert .bin byte buffers + the stitch.json text.
+     *
+     * Args:
+     *   expert_bins: Vec<Uint8Array> in JS — each is the contents of an
+     *                expert's .bin file (already decompressed).
+     *   stitch_json: stringified stitch.json contents.
+     *
+     * JS marshals Vec<Uint8Array> via wasm-bindgen as a single
+     * `Box<[Box<[u8]>]>`-shaped thing. We flatten with a simpler shape:
+     * take a flat byte array + a list of offsets+lengths.
+     */
+    constructor(flat_bytes: Uint8Array, bin_offsets: Uint32Array, stitch_json: string);
+    reset(): void;
+    step(token: number): WasmStitchStep;
+    /**
+     * Return expert names as a single comma-joined string. JS splits on `,`.
+     * Avoids the wasm-bindgen overhead of returning Vec<String>.
+     */
+    readonly expert_names: string;
+    readonly num_experts: number;
+    readonly position: number;
+    readonly vocab_size: number;
+}
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_wasmmodel_free: (a: number, b: number) => void;
     readonly __wbg_wasmstep_free: (a: number, b: number) => void;
+    readonly __wbg_wasmstitchedengine_free: (a: number, b: number) => void;
+    readonly __wbg_wasmstitchstep_free: (a: number, b: number) => void;
     readonly wasmmodel_meaning_dim: (a: number) => number;
     readonly wasmmodel_new: (a: number, b: number, c: number) => void;
     readonly wasmmodel_num_experts: (a: number) => number;
@@ -68,9 +121,25 @@ export interface InitOutput {
     readonly wasmstep_logits: (a: number, b: number) => void;
     readonly wasmstep_meaning: (a: number, b: number) => void;
     readonly wasmstep_routing_flat: (a: number, b: number) => void;
-    readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
+    readonly wasmstitchedengine_expert_names: (a: number, b: number) => void;
+    readonly wasmstitchedengine_force_expert: (a: number, b: number) => void;
+    readonly wasmstitchedengine_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+    readonly wasmstitchedengine_num_experts: (a: number) => number;
+    readonly wasmstitchedengine_position: (a: number) => number;
+    readonly wasmstitchedengine_reset: (a: number) => void;
+    readonly wasmstitchedengine_step: (a: number, b: number) => number;
+    readonly wasmstitchedengine_vocab_size: (a: number) => number;
+    readonly wasmstitchstep_chosen_expert: (a: number) => number;
+    readonly wasmstitchstep_classifier_probs: (a: number, b: number) => void;
+    readonly wasmstitchstep_confidence: (a: number) => number;
+    readonly wasmstitchstep_logits: (a: number, b: number) => void;
+    readonly wasmstitchstep_warmup_happened: (a: number) => number;
+    readonly wasmstitchstep_warmup_tokens: (a: number) => number;
     readonly __wbindgen_export: (a: number, b: number) => number;
-    readonly __wbindgen_export2: (a: number, b: number, c: number) => void;
+    readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
+    readonly __wbindgen_export3: (a: number) => void;
+    readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
+    readonly __wbindgen_export4: (a: number, b: number, c: number) => void;
 }
 
 export type SyncInitInput = BufferSource | WebAssembly.Module;

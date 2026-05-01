@@ -179,9 +179,14 @@ class Attention(nn.Module):
         self.w_k = QuantizedLinear(dim, dim, bias=False)
         self.w_v = QuantizedLinear(dim, dim, bias=False)
         self.w_o = QuantizedLinear(dim, dim, bias=False)
-        # QK-Norm — RMSNorm per-head, applied after projection
-        self.q_norm = nn.RMSNorm(self.head_dim)
-        self.k_norm = nn.RMSNorm(self.head_dim)
+        # QK-Norm — RMSNorm per-head, applied after projection.
+        # eps pinned to 1e-6: nn.RMSNorm's default eps adapts to dtype
+        # (~1e-3 at bf16, ~1e-7 at fp32) which causes silent train↔deploy
+        # drift. Rust hardcodes RMS_EPS = 1.1920929e-7 — picking 1e-6
+        # here is a single value that's safe at both bf16 and fp32 and
+        # close enough to Rust's value that drift stays sub-noise.
+        self.q_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
+        self.k_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
 
     def forward(self, x, return_attn=False):
         B, T, C = x.shape
@@ -218,7 +223,7 @@ class StandardFFN(nn.Module):
         self.down = QuantizedLinear(hidden, dim, bias=False)
 
     def forward(self, x):
-        return self.down(F.gelu(self.up(x)))
+        return self.down(F.gelu(self.up(x), approximate="tanh"))
 
 
 class SwiGLUFFN(nn.Module):
@@ -242,7 +247,12 @@ class DeepNarrowFFN(nn.Module):
         self.l4 = QuantizedLinear(mid, dim, bias=False)
 
     def forward(self, x):
-        return self.l4(F.gelu(self.l3(F.gelu(self.l2(F.gelu(self.l1(x)))))))
+        # GELU pinned to tanh approximation to match Rust's wasm forward
+        # (forward.rs:54 uses the tanh-approx form). PyTorch's default is
+        # exact erf-based GELU; difference is up to 1e-3 around |x|≈1
+        # which adds up across 4 layers × 4 experts.
+        a = "tanh"
+        return self.l4(F.gelu(self.l3(F.gelu(self.l2(F.gelu(self.l1(x), approximate=a)), approximate=a)), approximate=a))
 
 
 class BottleneckFFN(nn.Module):
@@ -254,7 +264,8 @@ class BottleneckFFN(nn.Module):
         self.out_proj = QuantizedLinear(hidden, dim, bias=False)
 
     def forward(self, x):
-        return self.out_proj(F.gelu(self.up_proj(F.gelu(self.down_proj(x)))))
+        a = "tanh"  # match Rust forward.rs:54 (tanh approximation)
+        return self.out_proj(F.gelu(self.up_proj(F.gelu(self.down_proj(x), approximate=a)), approximate=a))
 
 
 EXPERT_TYPES = [StandardFFN, SwiGLUFFN, DeepNarrowFFN, BottleneckFFN]
@@ -326,9 +337,9 @@ class HighwayBlock(nn.Module):
     def __init__(self, cfg: TinyHetMoEConfig):
         super().__init__()
         self.cfg = cfg
-        self.n1 = nn.RMSNorm(cfg.internal_dim)
+        self.n1 = nn.RMSNorm(cfg.internal_dim, eps=1e-6)
         self.attn = Attention(cfg.internal_dim, cfg.num_heads)
-        self.n2 = nn.RMSNorm(cfg.internal_dim)
+        self.n2 = nn.RMSNorm(cfg.internal_dim, eps=1e-6)
         self.moe = HetMoE(
             cfg.internal_dim, cfg.num_experts, cfg.top_k_experts,
             cfg.ffn_mult, cfg.load_balance_weight,
@@ -398,7 +409,7 @@ class TinyHetMoE(nn.Module):
         intuition_internal = cfg.intuition_dim + cfg.new_intuition
         self.compress = QuantizedLinear(intuition_internal, cfg.intuition_dim, bias=False)
 
-        self.norm = nn.RMSNorm(cfg.input_dim)
+        self.norm = nn.RMSNorm(cfg.input_dim, eps=1e-6)
         self.lm_head = QuantizedLinear(cfg.input_dim, cfg.vocab_size, bias=False)
 
     def load_meaning_embeddings(self, path: str, freeze: bool = False):
@@ -472,23 +483,30 @@ class TinyHetMoE(nn.Module):
         # quantization overhead. Critical: this matmul MUST go through
         # the ternary path during QAT, otherwise lm_head trains as FP and
         # the deployed ternary export has no learned signal for it.
-        # (Pre-fix the loss path bypassed QAT and ternary lm_head was a
-        # quality cliff at deployment time.)
-        if self.lm_head.quantize:
-            w_lm = ternary_quantize(self.lm_head.weight)
-        else:
-            w_lm = self.lm_head.weight
-        h_flat = hidden.reshape(-1, hidden.size(-1))
-        t_flat = targets.reshape(-1)
-        CHUNK = 1024
-        total = 0.0
-        count = 0
-        for i in range(0, h_flat.shape[0], CHUNK):
-            h = h_flat[i:i + CHUNK]
-            t = t_flat[i:i + CHUNK]
-            logits = h @ w_lm.t()
-            total = total + F.cross_entropy(logits, t, reduction="sum")
-            count += t.shape[0]
+        #
+        # Force fp32 for the entire loss path: under bf16 autocast the
+        # logits matmul would happen in bf16, producing CE values that
+        # don't match the fp32-deployed wasm engine's output. Pinning
+        # fp32 here makes reported val numbers honest at the deployed
+        # numerical precision. Cost is small (one chunked vocab matmul
+        # per step) but the train↔deploy correspondence is the win.
+        with torch.amp.autocast("cuda", enabled=False):
+            hidden_fp32 = hidden.float()
+            if self.lm_head.quantize:
+                w_lm = ternary_quantize(self.lm_head.weight.float())
+            else:
+                w_lm = self.lm_head.weight.float()
+            h_flat = hidden_fp32.reshape(-1, hidden_fp32.size(-1))
+            t_flat = targets.reshape(-1)
+            CHUNK = 1024
+            total = 0.0
+            count = 0
+            for i in range(0, h_flat.shape[0], CHUNK):
+                h = h_flat[i:i + CHUNK]
+                t = t_flat[i:i + CHUNK]
+                logits = h @ w_lm.t()
+                total = total + F.cross_entropy(logits, t, reduction="sum")
+                count += t.shape[0]
         return None, total / count + aux_total
 
 

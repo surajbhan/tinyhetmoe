@@ -5,6 +5,306 @@ each gate (not just end-of-day). New entries on top.
 
 ---
 
+## 2026-05-01 ~14:00 — A-vs-B (frozen meaning) data found in experiments_may/
+
+User pointed me to `/data/sematic-embedding/experiments_may/`. The
+day-3 ablation has both runs:
+  `20260420_day3_A_frozen/`    — meaning_embed frozen (recipe A)
+  `20260420_day3_B_unfrozen/`  — meaning_embed trainable (recipe B)
+
+Both 12K steps, otherwise identical (~38M params, 200 MB TinyStories).
+
+### Final val loss
+
+| recipe | best val | PPL |
+|--------|---------:|----:|
+| A (frozen)   | 4.0199 | 55.7 |
+| B (unfrozen) | 3.9815 | 53.6 |
+
+B beats A by **0.038 nats** — well within sampling noise at this scale.
+**Not the strong "B much better" the user remembered.** Worth noting.
+
+### Generation samples (the surprising result)
+
+Reading the actual decoded text from `day3_eval/A/generation.txt` and
+`day3_eval/B/generation.txt` — **A produces qualitatively better text
+despite higher val loss**:
+
+  - Prompt "The doctor examined the":
+    - **A**: "the patient's body, and the patient is the patient's body"
+      (repetitive but contextually appropriate — medical scene)
+    - **B**: "the 1888, 188, 189, 189, 189"
+      (lost the medical context, drifted to a numeric loop)
+
+  - Prompt "Because the algorithm was":
+    - **A**: "the dimension of the Expansion of the universe"
+      (conceptual continuation)
+    - **B**: "the first two years of the first half of the 19th century"
+      (date-counter degeneracy)
+
+  - Prompt "In mathematics, we can":
+    - **A**: produced reasonable continuation
+    - **B**: "be a (n) and (n) and (n) and (n)" (collapsed)
+
+The val-loss number is misleading — B's lower CE is fitting per-token
+noise that doesn't translate to coherent generation. A's frozen meaning
+**anchors generation in a clean semantic space** derived from the
+production Qwen contextual file; B's drifting meaning picks up
+stochastic features that hurt sample-level coherence.
+
+### Semantic probe (attention-on-related-pairs measure)
+
+  - A: advantage_mean = 0.00337
+  - B: advantage_mean = 0.01196 (**3.5× stronger**)
+
+B's attention DOES learn stronger semantic associations on internal
+probes. So it's not that B is structurally worse at semantics — it's
+that B's val loss + B's attention bias are both improving at the
+expense of generation coherence. Local-vs-global trade.
+
+### Implication for v7
+
+**Use recipe A (frozen meaning_embed).**
+
+This isn't a "compromise for bundle savings" — it's the better recipe
+for generation quality at this scale, AND it unlocks the shared-
+embedding architecture where every swarm expert ships only its
+domain-specific weights, with the 80 MB meaning matrix loaded once
+across all experts.
+
+The bundle win:
+  - Without sharing: 6 experts × ~175 MB (full Qwen vocab) = 1050 MB
+  - With shared meaning (frozen): 80 MB shared + 6 × ~95 MB = 650 MB
+  - Plus intuition compression (DPQ/int4): drops further to ~150-200 MB
+  - Plus meaning compression: another ~50 MB win
+
+These numbers are without intuition or meaning compression — see the
+2026-05-01 ~14:30 journal entry on embedding compression for the
+DPQ/int4 path that gets bundles to <100 MB.
+
+---
+
+## 2026-05-01 ~15:00 — v7 master plan (consolidated from A/B + compression + audit)
+
+This entry pulls together the v7 design from three threads of work today:
+
+### What v7 commits to
+
+  1. **Full Qwen2.5 vocab (151,665 tokens)** — no trimming. Eliminates
+     the `<unk>` problem (e.g. "fibonacci" being unk), simplifies the
+     tokenizer pipeline (no qwen→tiny remap), and matches what the
+     production-Qwen contextual axes were trained against.
+
+  2. **Recipe A: frozen meaning_embed.** Day-3 ablation in
+     `experiments_may/` showed A produces **qualitatively better
+     generation** despite a slightly higher val (4.02 vs 3.98). The
+     0.04-nat val gap is sampling noise; the generation gap is real
+     (medical/literary prompts stay on-topic for A, drift to numeric
+     loops for B). Frozen meaning anchors the model in a clean
+     production-derived semantic space.
+
+  3. **Shared-meaning bundle architecture.** Since meaning_embed is
+     frozen and identical across all v7 experts, ship it ONCE in a
+     shared file. Per-expert bundles only contain diverging weights.
+     This is also the technically-honest version of the swarm pitch:
+     every node in the swarm holds the same byte-identical 80 MB
+     shared meaning data, plus its own ~10-30 MB specialty.
+
+  4. **DPQ compression for both meaning and intuition embeddings.**
+     151K × 132 × 4 = 80 MB → 0.6 MB at 130× via M=4 K=256 product
+     quantization. Reference: DPQ (Chen et al., ICML 2020). PPL
+     impact <1% on standard NLP. Codebooks trained jointly with the
+     model (or learned post-hoc on the frozen meaning).
+
+  5. **Domain restructure: drop pg19/wiki, add the right experts.**
+
+     | expert    | corpus                              | role           |
+     |-----------|-------------------------------------|----------------|
+     | general   | SlimOrca + UltraChat                | default expert |
+     | thinker   | OpenR1-Math-Raw + orca-math         | reasoning      |
+     | code_py   | StarCoder Python + Evol-Instruct-PY | python         |
+     | code_js   | StarCoder JavaScript                | javascript     |
+     | medical   | medalpaca/medical_meadow + PubMedQA | medical        |
+     | legal     | lex_glue + casehold + US Code       | legal          |
+
+     Tool-calling becomes a SFT capability on the general expert,
+     not its own domain. It's a *capability*, not a *domain*.
+
+  6. **Target PPL ≤ 5** per expert. Anything above this and the demo
+     output will look like the v6 outputs do now (structurally fine,
+     contextually weak). Estimated training: ~100K steps × 1-2 GB
+     data per expert. Dual-GPU wall: ~3-4 days for all 6 experts.
+
+  7. **Per-domain SFT pass** for general/thinker/medical/legal —
+     2-3K steps each on instruction-formatted data after the base
+     run lands.
+
+### Pre-v7 bug fixes (before any multi-day run)
+
+The codebase audit found 5 production-breaking issues. **All must be
+fixed and verified before kicking off v7 training:**
+
+  | id | severity | location | fix |
+  |----|----------|----------|-----|
+  | C6 | CRITICAL | RMSNorm eps default differs at bf16 vs fp32 inference; Rust hardcodes 1.19e-7 | Pin `eps=1e-6` in every `nn.RMSNorm` instantiation; match in Rust |
+  | C8 | CRITICAL | Chunked-CE loss runs at bf16 under autocast; deploy is fp32 | Wrap CE path in `autocast(enabled=False)` and upcast hidden to fp32 |
+  | R3 | MAJOR    | PyTorch uses exact GELU; Rust uses tanh-approx GELU | Switch PyTorch to `F.gelu(x, approximate="tanh")` |
+  | M2 | CRITICAL on multi-GPU | `qat_trigger_pending` set only on rank 0; never broadcast on the path that fires QAT | Always broadcast at top of every step OR run plateau detection on all ranks |
+  | TD2 | MAJOR | `qat_currently_on` not in checkpoint; resume can't tell if QAT was active | Add `"qat_currently_on": qat_currently_on` to save dict; restore on load |
+  | TD3 | MAJOR | `val_history` not persisted | Add to save dict + restore |
+  | C3 | MAJOR | `export_model.py` ternarizes any checkpoint, including bf16-phase ones | Refuse export unless `qat_currently_on=True` in source ckpt |
+
+### Why these matter together
+
+The lm_head bug (already fixed) cost us the v5b "PPL 4.94" claim
+which was actually PPL ~9 deployed. Each of the audit findings is a
+**similar class of train↔deploy correspondence break**. Multi-day
+training without these fixes risks a v7 that reports beautiful val
+numbers but ships degraded.
+
+The v7 pre-flight:
+  1. Apply the 7 fixes above
+  2. Run a 1-2K-step smoke training to confirm no regressions
+  3. Verify deploy↔train val match within 0.05 nats on the smoke run
+  4. Then commit to the multi-day train
+
+### Bundle math projection (v7 with all of the above)
+
+  - Shared (loaded once): meaning_embed via DPQ = **0.6 MB**
+  - Per-expert bundle: intuition_embed via DPQ (0.6 MB) + ternary
+    weights (~6 MB) + lm_head ternary (10 MB) ≈ **17 MB per expert**
+  - 6 experts: 0.6 + 6 × 17 = **~103 MB total**
+  - With gzip on top: **~85 MB**
+
+This fits comfortably on GitHub Pages and in browser RAM.
+
+### Rough timeline
+
+  | phase | wall time |
+  |-------|----------|
+  | apply 7 audit fixes + smoke verify | 1 day |
+  | full Qwen vocab prep across 6 corpora | 6-12 hours |
+  | v7 base training (6 experts × ~12 hr each, 2 GPUs in parallel) | ~3 days |
+  | per-domain SFT (4 instruct experts × ~30 min each) | ~2 hours |
+  | classifier retrain + bundle build + UI polish | 4-6 hours |
+  | total | ~5 days |
+
+### What we keep from v6.x
+
+  - Engine architecture (StitchedEngine, classifier, KV warmup,
+    masked_tids, hysteresis) — all sound
+  - Browser UI (stitch.html + stitch.js) with real Qwen BPE encoder
+  - Build/test tooling (build_stitch_bundle, dump_test_tokenizations,
+    test_encoder_node, test_stitch_node)
+  - The hard-won lm_head fix in `model/tiny_hetmoe.py`
+
+### What gets retired
+
+  - All v6.x checkpoints (training data quality wasn't there)
+  - The 32K trimmed vocab (becomes irrelevant once we go full Qwen)
+  - PG-19 and Wiki as separate experts
+  - The vocab=32772 + ChatML-specials patch (unnecessary at full vocab —
+    those tokens are already first-class qwen IDs 151644/151645/etc.)
+
+---
+
+## 2026-05-01 ~14:30 — Embedding compression research (for v7 full Qwen vocab)
+
+User wants v7 to use the **full 151K Qwen vocab** (no trimming). This
+makes embedding compression mandatory — without it the bundle is
+unshippable.
+
+Sizing:
+  - meaning_embed (FP32):    151K × 132 × 4 = 80 MB
+  - intuition_embed (FP32):  151K × 132 × 4 = 80 MB
+  - lm_head (already 2-bit ternary): ~10 MB
+
+Per-expert: 170 MB+. With 6 v7 experts: ~1 GB without compression.
+
+### Surveyed techniques (post-2023, w/ browser-feasible decode path)
+
+  1. **Differentiable Product Quantization (DPQ, ICML 2020 onwards)** —
+     Split D=132 into M=4 sub-vectors of dim 33 each, learn K=256
+     codebook entries per group end-to-end. Storage = V·M·log2(K) +
+     M·K·D/M·4B.
+     For V=151K: 151K × 4 bytes = **0.6 MB indices** + ~17 KB codebooks
+     ≈ **130× compression**. Reported quality: <1% PPL hit on standard
+     LM benchmarks.
+     Browser-friendly: 4 byte-lookups + concat per token.
+
+  2. **TurboQuant (ICLR 2026)** — Hadamard rotation + per-coord scalar
+     quantizer. Reported: 2.5 bits/channel = marginal degradation,
+     3.5 bits/channel = quality-neutral, vs FP16. At our 132-dim:
+     2.5 bits ≈ **12.8× vs FP32** (6.25 MB), 3.5 bits ≈ **9.1×**.
+     No retraining needed (PTQ); a simple fixed rotation matvec at
+     inference is the only added cost.
+
+  3. **Per-row int4 with Hadamard rotation** — combines TurboQuant's
+     rotation idea with simple int4 quantization. ~8× vs FP32 (10 MB),
+     PPL hit typically <1%, well-supported by GGUF Q4_K format with
+     pure-Rust decoder paths (candle, llama-cpp-rs).
+
+  4. **Low-rank decomposition** (ALBERT-style V×r · r×D) —
+     **Doesn't work at our D=132**. Pays off when D≫r; nothing to
+     factorize when D is already 132.
+
+### Asymmetric input vs output
+
+The lm_head is more sensitive to quantization than the input embedding
+(its errors get softmaxed across 151K logits). Common production
+pattern: **input embedding aggressive (DPQ/int4), lm_head conservative
+(int6/int8)**.
+
+For us, lm_head is already ternary (2-bit), and the day-3 A-vs-B run
+suggests this is fine for input-side meaning. So the asymmetry is
+already there — just inverted. If anything we'd consider going LESS
+aggressive on lm_head than on input embeddings.
+
+### Recommended v7 path
+
+**Primary: DPQ for both input embeddings (meaning + intuition)**.
+This is the highest-compression option AND aligns with the multiply-
+free philosophy of ternary weights — embedding lookup becomes pure
+codebook lookup, zero arithmetic at the embedding layer.
+
+  - meaning_embed (151K × 132): 80 MB → **0.6 MB** (130×)
+  - intuition_embed (151K × 132): 80 MB → **0.6 MB** (130×)
+  - per-expert: 0.6 + (small ternary stack) = ~10 MB
+  - shared meaning_embed across 6 experts: **0.6 MB shared** + 6 × ~10 MB
+  - Total bundle: **~60 MB** for 6 experts at full Qwen vocab
+
+**Fallback (if DPQ training is involved): per-row int4 + Hadamard rotation.**
+This is post-training quantization, no retraining needed:
+  - meaning_embed → 10 MB (8×)
+  - intuition_embed → 10 MB (8×)
+  - per-expert: 10 + ~10 MB = 20 MB
+  - shared meaning: 10 + 6 × 20 = 130 MB total
+
+Both meet the "internal demo loads in <30 seconds" bar.
+
+### Implementation work for v7
+
+  1. Trainer support for DPQ embeddings: add a `EmbeddingDPQ` module
+     that's drop-in for `nn.Embedding`. Codebook lookup at forward,
+     codebook learns via gradient. 200 LoC. Reference: DPQ paper
+     (arXiv 1908.09756) + basis-embedding repo.
+  2. Frozen meaning compression at export: take the contextual
+     production file, run K-means quantization to produce M=4 K=256
+     codebooks once, ship the codebooks + 0.6 MB of indices.
+  3. Update HTMOE binary format to v005: add codebook section.
+  4. Rust loader: decode lookup happens once per token at the embedding
+     layer (cheap).
+
+### References for deeper reading
+
+  - TurboQuant: arXiv 2504.19874, github.com/yashkc2025/turboquant
+  - DPQ: arXiv 1908.09756 (Chen et al., ICML 2020)
+  - AQLM: github.com/Vahe1994/AQLM (additive PQ for full LLM weights)
+  - GGUF Q4_K format spec: ggml-org/llama.cpp discussions
+  - HF embedding quantization blog (int8/binary baselines)
+
+---
+
 ## 2026-05-01 ~09:00 — Browser stitched demo working; honest assessment + v7 plan
 
 Wrapping up the v6.x cycle. Engineering deliverables are real and

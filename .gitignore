@@ -4,6 +4,9 @@
 runs/
 logs/
 
+# v7 tokenized corpora — produced by prepare_data_v7.py, regenerable.
+data_v7/
+
 # Tokenized corpora, per-token embeddings, and intermediate artifacts.
 # All regeneratable from scripts/{prepare_data*,make_*meaning_axes,
 # build_tool_corpus,tokenize_tool_corpus,patch_vocab_for_chatml,

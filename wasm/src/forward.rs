@@ -66,7 +66,10 @@ pub fn silu(x: f32) -> f32 {
 
 // PyTorch nn.RMSNorm with eps=None uses the FP32 epsilon (~1.19e-7).
 // We use a tiny value here for numerical parity.
-const RMS_EPS: f32 = 1.1920929e-7;
+// Pinned to 1e-6 to match PyTorch's nn.RMSNorm(..., eps=1e-6) — was
+// previously 1.1920929e-7 (f32 epsilon) which silently differed from
+// PyTorch's bf16-autocast default of ~1e-3, causing train↔deploy drift.
+const RMS_EPS: f32 = 1e-6;
 
 // ── Per-layer attention with QK-Norm ────────────────────────────────
 

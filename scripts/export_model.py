@@ -164,10 +164,37 @@ def write_ternary_packed(f, weight: torch.Tensor) -> tuple[int, int, int, int, i
     return bytes_written, total, zeros, pos, neg
 
 
-def export_model(ckpt_path: str, out_path: str, packed: bool = True):
+def export_model(ckpt_path: str, out_path: str, packed: bool = True,
+                 allow_bf16_phase: bool = False):
     print(f"[export] loading {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg_dict = ckpt.get("config", {})
+
+    # Train↔deploy guard: refuse to ternarize a checkpoint that wasn't
+    # trained with QAT on. The exporter ALWAYS hard-quantizes weights
+    # via `(W/α).round().clamp(-1,1) * α`. If the source ran at bf16
+    # the entire time (best.pt from bf16 phase, qat_currently_on=False),
+    # those weights have no QAT-aware optimization signal, and the
+    # ternarized export silently degrades quality at deployment.
+    # Caller must pass --allow-bf16-phase to override (e.g., for
+    # diagnostic exports of bf16 checkpoints).
+    qat_currently_on = ckpt.get("qat_currently_on")
+    if not allow_bf16_phase:
+        if qat_currently_on is False:
+            raise SystemExit(
+                "[export] REFUSED: source checkpoint has "
+                "qat_currently_on=False (still in bf16 phase). The "
+                "exporter ternarizes all weights unconditionally, but "
+                "those weights weren't optimized for ternary forward, "
+                "so the export would silently degrade at deployment.\n"
+                "  Source: " + str(ckpt_path) + "\n"
+                "  Pass --allow-bf16-phase to override (diagnostic only)."
+            )
+        elif qat_currently_on is None:
+            print("[export] WARN: source checkpoint has no "
+                  "qat_currently_on field (legacy pre-audit checkpoint). "
+                  "Cannot verify train↔deploy correspondence. Continuing.")
+
     cfg_kwargs = {k: cfg_dict[k] for k in [
         "vocab_size", "meaning_dim", "intuition_dim", "input_dim",
         "internal_dim", "new_intuition", "num_layers", "num_heads",
@@ -341,5 +368,11 @@ if __name__ == "__main__":
     p.add_argument("--out", default="model.bin")
     p.add_argument("--legacy", action="store_true",
                    help="Write HTMOE002 (1 byte/weight) instead of HTMOE003 packed")
+    p.add_argument("--allow-bf16-phase", action="store_true",
+                   help="Allow exporting a bf16-phase (non-QAT) checkpoint. "
+                        "By default the exporter refuses these because "
+                        "ternarizing them silently degrades deployment quality. "
+                        "Use only for diagnostic exports.")
     args = p.parse_args()
-    export_model(args.ckpt, args.out, packed=not args.legacy)
+    export_model(args.ckpt, args.out, packed=not args.legacy,
+                 allow_bf16_phase=args.allow_bf16_phase)

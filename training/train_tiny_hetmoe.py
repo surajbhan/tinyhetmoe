@@ -362,6 +362,7 @@ def main():
     best_qat_val = float("inf")
     resume_lr_scale = 1.0
     resume_state = None
+    resumed_val_history = None  # populated by resume block if present
     if tcfg.resume_from:
         resume_path = Path(resolve(tcfg.resume_from))
         if resume_path.exists():
@@ -372,28 +373,42 @@ def main():
             sd = resume_state["model"]
             sd = {k[7:] if k.startswith("module.") else k: v for k, v in sd.items()}
             missing, unexpected = model.load_state_dict(sd, strict=False)
-            if is_main and unexpected:
-                print(f"[tiny] unexpected keys: {unexpected[:3]}", flush=True)
+            if is_main:
+                if missing:
+                    print(f"[tiny] WARNING missing keys on resume: {missing[:5]}",
+                          flush=True)
+                if unexpected:
+                    print(f"[tiny] WARNING unexpected keys: {unexpected[:5]}",
+                          flush=True)
             start_step = int(resume_state.get("step", 0))
             best_val = float(resume_state.get("best_val", float("inf")))
             best_qat_val = float(resume_state.get("best_qat_val", float("inf")))
             resume_lr_scale = float(resume_state.get("lr_scale", 1.0))
+            # Persisted training-loop state (added post-audit). Lets resume
+            # pick up plateau detection, QAT phase, and val history exactly
+            # where the previous run left off.
+            resumed_qat_on = bool(resume_state.get("qat_currently_on", False))
+            resumed_val_history = resume_state.get("val_history", None)
             if is_main:
                 print(f"[tiny] resumed step {start_step}, best_val "
-                      f"{best_val:.4f}, lr_scale {resume_lr_scale:.3f}",
+                      f"{best_val:.4f}, lr_scale {resume_lr_scale:.3f}, "
+                      f"qat_currently_on={resumed_qat_on}",
                       flush=True)
         elif is_main:
             print(f"[tiny] resume_from path does not exist: {resume_path}",
                   flush=True)
 
-    # QAT mode setup. Three regimes:
+    # QAT mode setup. Four regimes (last one added post-audit):
     #   1. qat_from_zero=True: ternary forward from step 0 (default, current).
     #   2. qat_from_zero=False, qat_start_step=0: pure FP run, no ternary ever.
     #   3. qat_from_zero=False, qat_start_step>0: bf16-then-QAT — start FP,
-    #      switch to ternary at qat_start_step. This is the recipe the user
-    #      wants for v2 runs (better aligned ternary final).
+    #      switch to ternary at qat_start_step.
+    #   4. Resume from a checkpoint where qat_currently_on=True (e.g. via
+    #      qat_on_plateau): respect the persisted flag.
     qat_active_at_resume = (tcfg.qat_from_zero
-                             or (tcfg.qat_start_step > 0 and start_step >= tcfg.qat_start_step))
+                             or (tcfg.qat_start_step > 0 and start_step >= tcfg.qat_start_step)
+                             or (resume_state is not None
+                                 and bool(resume_state.get("qat_currently_on", False))))
     if qat_active_at_resume:
         n_qat = set_quantize_mode(model, on=True)
         if is_main:
@@ -464,7 +479,16 @@ def main():
     opt.zero_grad()
     model.train()
     ema_loss = None
-    val_history = []
+    # Restore val_history from resume if available — otherwise plateau
+    # detection re-arms from zero on every restart, which breaks
+    # qat_on_plateau / LR-halving for multi-day-with-resume runs.
+    if resumed_val_history:
+        val_history = list(resumed_val_history)
+        if is_main:
+            print(f"[tiny] restored val_history with {len(val_history)} entries",
+                  flush=True)
+    else:
+        val_history = []
     current_lr_scale = resume_lr_scale
 
     qat_currently_on = qat_active_at_resume
@@ -624,6 +648,8 @@ def main():
                         "optimizer": opt.state_dict(),
                         "step": step, "best_val": best_val,
                         "best_qat_val": best_qat_val,
+                        "qat_currently_on": qat_currently_on,
+                        "val_history": val_history,
                         "config": {**asdict(mcfg), **asdict(tcfg)},
                         "lr_scale": current_lr_scale,
                     }, out_dir / "checkpoints" / "best.pt")
@@ -639,6 +665,8 @@ def main():
                         "optimizer": opt.state_dict(),
                         "step": step, "best_val": best_val,
                         "best_qat_val": best_qat_val,
+                        "qat_currently_on": qat_currently_on,
+                        "val_history": val_history,
                         "config": {**asdict(mcfg), **asdict(tcfg)},
                         "lr_scale": current_lr_scale,
                     }, out_dir / "checkpoints" / "best_qat.pt")
@@ -693,6 +721,9 @@ def main():
                 "model": unwrapped.state_dict(),
                 "optimizer": opt.state_dict(),
                 "step": step, "best_val": best_val,
+                "best_qat_val": best_qat_val,
+                "qat_currently_on": qat_currently_on,
+                "val_history": val_history,
                 "config": {**asdict(mcfg), **asdict(tcfg)},
                 "lr_scale": current_lr_scale,
             }, ckpt_path)
@@ -703,6 +734,9 @@ def main():
             "model": unwrapped.state_dict(),
             "optimizer": opt.state_dict(),
             "step": step, "best_val": best_val,
+            "best_qat_val": best_qat_val,
+            "qat_currently_on": qat_currently_on,
+            "val_history": val_history,
             "config": {**asdict(mcfg), **asdict(tcfg)},
             "lr_scale": current_lr_scale,
         }, final)

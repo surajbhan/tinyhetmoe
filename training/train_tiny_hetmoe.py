@@ -150,13 +150,22 @@ class TrainCfg:
     # Caller is responsible for ensuring the corpus fits.
     gpu_resident_corpus: bool = False
 
+    # Token storage dtype on disk. v6 used uint16 (vocab ≤ 65535); v7
+    # uses uint32 (Qwen full vocab 151665). Mismatch silently corrupts
+    # every batch — must match what prepare_data_v* wrote.
+    token_dtype: str = "uint16"
+
 
 # ============================================================================
 # Dataset
 # ============================================================================
 
 class TinyStoriesDataset:
-    """Random-window sampler over a uint16 token corpus.
+    """Random-window sampler over a tokenized corpus.
+
+    `token_dtype` is "uint16" for vocab ≤ 65535 (v6) and "uint32" for
+    larger vocabs (v7+ uses Qwen full vocab 151665). Mismatch silently
+    corrupts every loaded window — always set this from the data meta.
 
     Two modes:
       - **memmap (default)**: data lives on disk via `np.memmap`. Each
@@ -165,28 +174,26 @@ class TinyStoriesDataset:
       - **GPU-resident** (`gpu_device != None`): the entire corpus is
         loaded once into a torch tensor on `gpu_device` at construction.
         `sample_batch` then just indexes into that GPU tensor — no
-        host→device transfer per batch.
-
-    For TinyStories specifically the data already has <bos>/<eos> markers
-    inserted by prepare_data.py, so a sliced window may straddle story
-    boundaries — fine, the model learns to use <bos>/<eos> as anchors."""
+        host→device transfer per batch."""
 
     def __init__(self, path: str, seq_len: int, seed: int = 1337,
-                 gpu_device: str | None = None):
+                 gpu_device: str | None = None,
+                 token_dtype: str = "uint16"):
         self.seq_len = seq_len
         self.rng = np.random.default_rng(seed)
         self.gpu_device = gpu_device
+        np_dtype = {"uint16": np.uint16, "uint32": np.uint32}[token_dtype]
 
         if gpu_device is not None:
             # Load whole file into a GPU int64 tensor (training expects int64
             # ids; since we'll index from this tensor directly we may as well
             # pre-cast to skip the per-batch dtype conversion).
-            arr = np.fromfile(path, dtype=np.uint16).astype(np.int64)
+            arr = np.fromfile(path, dtype=np_dtype).astype(np.int64)
             self.gpu_data = torch.from_numpy(arr).to(gpu_device, non_blocking=True)
             self.n_tokens = self.gpu_data.shape[0]
             self.cpu_data = None
         else:
-            self.cpu_data = np.memmap(path, dtype=np.uint16, mode="r")
+            self.cpu_data = np.memmap(path, dtype=np_dtype, mode="r")
             self.n_tokens = len(self.cpu_data)
             self.gpu_data = None
 
@@ -439,13 +446,16 @@ def main():
               flush=True)
     train_ds = TinyStoriesDataset(resolve(tcfg.train_file), tcfg.seq_len,
                                    seed=tcfg.seed + local_rank * 1000,
-                                   gpu_device=ds_device)
+                                   gpu_device=ds_device,
+                                   token_dtype=tcfg.token_dtype)
     val_ds = TinyStoriesDataset(resolve(tcfg.val_file), tcfg.seq_len,
                                  seed=tcfg.seed + 1 + local_rank * 1000,
-                                 gpu_device=ds_device)
+                                 gpu_device=ds_device,
+                                 token_dtype=tcfg.token_dtype)
+    bytes_per_tok = {"uint16": 2, "uint32": 4}[tcfg.token_dtype]
     if is_main:
-        train_mb = train_ds.n_tokens * 8 / 1e6 if tcfg.gpu_resident_corpus else train_ds.n_tokens * 2 / 1e6
-        val_mb = val_ds.n_tokens * 8 / 1e6 if tcfg.gpu_resident_corpus else val_ds.n_tokens * 2 / 1e6
+        train_mb = train_ds.n_tokens * 8 / 1e6 if tcfg.gpu_resident_corpus else train_ds.n_tokens * bytes_per_tok / 1e6
+        val_mb = val_ds.n_tokens * 8 / 1e6 if tcfg.gpu_resident_corpus else val_ds.n_tokens * bytes_per_tok / 1e6
         loc = "GPU" if tcfg.gpu_resident_corpus else "memmap"
         print(f"[tiny] train: {train_ds.n_tokens:,} tokens, "
               f"{train_mb:.0f} MB on {loc}", flush=True)

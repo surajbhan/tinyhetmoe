@@ -5,6 +5,70 @@ each gate (not just end-of-day). New entries on top.
 
 ---
 
+## 2026-05-01 ~16:30 — v7 batch 1 launched on Atlas (single-host fallback)
+
+Tried 3-host cluster (Atlas + 132 + 109, 6 GPUs). Two failures forced
+the fallback:
+  - **132**: trainings die silently after corpus load when stderr is
+    merged into the same logfile via `2>&1` under nohup. Reproed in
+    isolation with separate stderr file → trainer runs fine. Stderr
+    buffering edge case under detached SSH; trainer itself is healthy.
+  - **109**: hard-locked the moment both 4060 Ti + 3060 started loading
+    corpus. No kernel oops in journal — box went unreachable from both
+    Atlas and 132 within seconds. User had to physically pull power to
+    recover. Saved as project memory: 109 is unstable under multi-GPU
+    load (5 unexplained reboots since April), use only one GPU at a
+    time. Suspected PSU sag.
+
+Decision: **Atlas-only**, 3 batches × 2 GPUs = 6 trainings serialized
+into 3 pairs. Smoother and only ~12 hours wall vs ~4 with 6-GPU cluster.
+
+Updated `scripts/launch_v7.sh` to Atlas-only with `launch-batch <N>` /
+`queue-next` subcommands. Batch boundaries = a clean grep of "[tiny]
+done. final:" in each domain's log file.
+
+Batch 1 is in flight:
+  - code_py (GPU 0, step 1000+)  loss ema 5.84  val 4.99  16K tok/s
+  - code_js (GPU 1, step 1100+)  loss ema 5.20  val 5.20  16K tok/s
+  Expected pair finish ~4 hours from launch (16:17), so ~20:30 IST.
+  Then queue-next launches batch 2 (general + thinker).
+
+Pre-flight (audit) all green:
+  - Trainer patched for uint32 tokens (was hard-coded uint16 → would
+    have silently corrupted v7's Qwen-vocab corpus).
+  - Audit verify (verify_audit_fixes.py) shows train↔deploy CE delta
+    of ≤ 1e-6 nats both bf16 and QAT phases on all 3 hosts. The audit
+    fixes (RMSNorm eps=1e-6, fp32 chunked-CE, ternary lm_head pre-quant
+    in train path) hold up.
+
+---
+
+## 2026-05-01 ~16:00 — v7 corpus prep finished + meaning_axes_full built
+
+Final v7 corpus on Atlas (`data_v7/`):
+  general    312M tokens   1.2 GB  (SlimOrca + UltraChat)
+  thinker     73M tokens   277 MB  (orca-math)
+  code_py    377M tokens   1.5 GB  (StarCoder Python)
+  code_js    389M tokens   1.5 GB  (StarCoder JS)
+  medical     78M tokens   299 MB  (medqa + MedText + lavita + PubMedQA)  ← 3.7× re-prep
+  legal      117M tokens   447 MB  (SCOTUS + case_hold + case_doc_summary) ← 4.7× re-prep
+  TOTAL    1.35 B tokens
+
+Initial medical/legal at 21M/25M was too thin; re-prepped with
+additional corpora (BI55/MedText, lavita, SCOTUS opinions,
+legal_case_document_summarization) and got proper sizes.
+
+Built `data_v7/meaning_axes_full_132.npy` (151,665 × 132 fp32, 77 MB)
+by copying `contextual_axis_embeddings.npy` directly (already at full
+Qwen vocab). Recipe A (frozen meaning) means this file is loaded once
+and never trained.
+
+Tokenizer is Qwen2.5-Coder-0.5B (151,665 tokens, uint32 on disk).
+Eliminates the `<unk>` issue from v6's 32K subset vocab where words
+like "fibonacci" tokenized to UNK.
+
+---
+
 ## 2026-05-01 ~14:00 — A-vs-B (frozen meaning) data found in experiments_may/
 
 User pointed me to `/data/sematic-embedding/experiments_may/`. The

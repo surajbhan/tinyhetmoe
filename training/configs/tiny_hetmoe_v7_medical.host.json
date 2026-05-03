@@ -1,0 +1,69 @@
+{
+  "run_name": "tiny_hetmoe_v7_medical",
+  "out_dir": "runs/tiny_hetmoe_v7_medical",
+  "resume_from": "",
+  "vocab_size": 151665,
+  "meaning_dim": 132,
+  "intuition_dim": 132,
+  "input_dim": 264,
+  "internal_dim": 528,
+  "new_intuition": 264,
+  "num_layers": 4,
+  "num_heads": 4,
+  "num_experts": 4,
+  "top_k_experts": 2,
+  "ffn_mult": 2.0,
+  "max_seq_len": 2048,
+  "load_balance_weight": 0.01,
+  "train_file": "data_v7/v7_train_medical.bin",
+  "val_file": "data_v7/v7_val_medical.bin",
+  "meaning_emb_path": "data_v7/meaning_axes_full_132.npy",
+  "token_dtype": "uint32",
+  "seq_len": 512,
+  "micro_batch": 16,
+  "grad_accum": 2,
+  "var_lengths": [
+    {
+      "seq_len": 256,
+      "micro_batch": 32,
+      "weight": 0.25
+    },
+    {
+      "seq_len": 512,
+      "micro_batch": 16,
+      "weight": 0.4
+    },
+    {
+      "seq_len": 1024,
+      "micro_batch": 8,
+      "weight": 0.25
+    },
+    {
+      "seq_len": 2048,
+      "micro_batch": 4,
+      "weight": 0.1
+    }
+  ],
+  "max_steps": 30000,
+  "warmup_steps": 200,
+  "lr": 0.0002,
+  "min_lr": 1e-05,
+  "weight_decay": 0.01,
+  "max_grad_norm": 1.0,
+  "log_interval": 100,
+  "val_interval": 250,
+  "save_interval": 1000,
+  "val_seqs": 50,
+  "keep_recent_ckpts": 2,
+  "seed": 2026,
+  "dtype": "bf16",
+  "lr_plateau_patience": 8,
+  "lr_floor": 1e-05,
+  "lr_decay_factor": 0.5,
+  "freeze_meaning": true,
+  "qat_from_zero": false,
+  "qat_start_step": 0,
+  "qat_on_plateau": true,
+  "qat_backward_mode": "ste",
+  "gpu_resident_corpus": true
+}

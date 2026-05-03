@@ -109,6 +109,16 @@ def write_fp32(f, tensor: torch.Tensor) -> int:
     return 4 + data.nbytes
 
 
+def write_fp16(f, tensor: torch.Tensor) -> int:
+    """Write tensor as: u32 count, count*f16. Half the bytes of fp32, lossless
+    cast for our embedding tables (we measured 0.0 nat val PPL change).
+    Reader reconstructs fp32 by casting on load."""
+    data = tensor.detach().to(torch.float16).cpu().contiguous().numpy()
+    f.write(struct.pack("<I", data.size))
+    f.write(data.tobytes())
+    return 4 + data.nbytes
+
+
 def write_ternary(f, weight: torch.Tensor) -> tuple[int, int, int, int, int]:
     """Write tensor as: f32 scale, u32 ndim, ndim u32 shape, total int8 values.
     Returns (bytes_written, total, zeros, pos, neg).
@@ -164,8 +174,37 @@ def write_ternary_packed(f, weight: torch.Tensor) -> tuple[int, int, int, int, i
     return bytes_written, total, zeros, pos, neg
 
 
+def export_meaning_shared(ckpt_path: str, out_path: str):
+    """Write ONLY the meaning_embed as a standalone shared file. All
+    experts have the same frozen meaning_embed (Recipe A), so the
+    browser downloads this once and uses it across every expert.
+
+    Wire format:
+      magic        "MNGSHR04" (8 bytes)
+      vocab_size   u32
+      meaning_dim  u32
+      data         vocab_size * meaning_dim * fp16 little-endian
+    """
+    print(f"[meaning] loading {ckpt_path}")
+    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    sd = ck.get("model", ck)
+    sd = {k.removeprefix("module."): v for k, v in sd.items()}
+    w = sd["meaning_embed.weight"].detach()
+    V, D = w.shape
+    print(f"[meaning] shape: ({V}, {D})  fp16  size {V*D*2/1e6:.2f} MB")
+    with open(out_path, "wb") as f:
+        f.write(b"MNGSHR04")
+        f.write(struct.pack("<I", V))
+        f.write(struct.pack("<I", D))
+        f.write(w.to(torch.float16).contiguous().numpy().tobytes())
+    sz = Path(out_path).stat().st_size / 1e6
+    print(f"[meaning] wrote {out_path}: {sz:.2f} MB")
+
+
 def export_model(ckpt_path: str, out_path: str, packed: bool = True,
-                 allow_bf16_phase: bool = False):
+                 allow_bf16_phase: bool = False,
+                 fp16_embeddings: bool = False,
+                 skip_meaning: bool = False):
     print(f"[export] loading {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg_dict = ckpt.get("config", {})
@@ -229,9 +268,20 @@ def export_model(ckpt_path: str, out_path: str, packed: bool = True,
     bytes_packed = 0
     bytes_fp = 0
 
-    magic = b"HTMOE003" if packed else b"HTMOE002"
+    # Magic encoding: HTMOE003 (packed ternary, fp32 embeds) was the v6 default.
+    # HTMOE004 adds fp16 embeddings + optional skip-meaning (paired with a
+    # shared meaning_shared.bin). We write HTMOE004 when either flag is set.
+    if fp16_embeddings or skip_meaning:
+        magic = b"HTMOE004"
+    else:
+        magic = b"HTMOE003" if packed else b"HTMOE002"
     write_ternary_fn = write_ternary_packed if packed else write_ternary
-    print(f"[export] writing {out_path} ({'packed 2-bit' if packed else 'int8'} ternary)")
+    write_embed_fn = write_fp16 if fp16_embeddings else write_fp32
+    embed_dtype_str = "fp16" if fp16_embeddings else "fp32"
+    print(f"[export] writing {out_path} (magic {magic.decode()}, "
+          f"{'packed 2-bit' if packed else 'int8'} ternary, "
+          f"{embed_dtype_str} embeddings"
+          f"{', meaning skipped' if skip_meaning else ''})")
     with open(out_path, "wb") as f:
         f.write(magic)
 
@@ -255,11 +305,16 @@ def export_model(ckpt_path: str, out_path: str, packed: bool = True,
             for arch in layer_archs:
                 f.write(struct.pack("<B", arch))
 
-        # M+I embeddings (FP32, not ternary — small + needs precision)
-        print("[export] meaning_embed", model.meaning_embed.weight.shape)
-        bytes_fp += write_fp32(f, model.meaning_embed.weight)
-        print("[export] intuition_embed", model.intuition_embed.weight.shape)
-        bytes_fp += write_fp32(f, model.intuition_embed.weight)
+        # M+I embeddings — fp32 by default, fp16 with --fp16-embed.
+        # Skip meaning_embed when --no-meaning is set; the reader expects
+        # to load it from a separate shared file (see export_meaning_shared).
+        if not skip_meaning:
+            print(f"[export] meaning_embed", model.meaning_embed.weight.shape, embed_dtype_str)
+            bytes_fp += write_embed_fn(f, model.meaning_embed.weight)
+        else:
+            print(f"[export] meaning_embed SKIPPED (will be in shared file)")
+        print(f"[export] intuition_embed", model.intuition_embed.weight.shape, embed_dtype_str)
+        bytes_fp += write_embed_fn(f, model.intuition_embed.weight)
 
         # Expand projection (ternary)
         print("[export] expand", model.expand.weight.shape)
@@ -335,7 +390,9 @@ def export_model(ckpt_path: str, out_path: str, packed: bool = True,
     # Sidecar metadata for the UI
     meta_path = Path(out_path).with_suffix(".meta.json")
     meta = {
-        "format": "HTMOE003" if packed else "HTMOE002",
+        "format": magic.decode("ascii"),
+        "fp16_embeddings": fp16_embeddings,
+        "meaning_skipped": skip_meaning,
         "training_step": int(ckpt.get("step", 0)),
         "best_val": float(ckpt.get("best_val", float("nan"))),
         "config": {
@@ -368,11 +425,22 @@ if __name__ == "__main__":
     p.add_argument("--out", default="model.bin")
     p.add_argument("--legacy", action="store_true",
                    help="Write HTMOE002 (1 byte/weight) instead of HTMOE003 packed")
-    p.add_argument("--allow-bf16-phase", action="store_true",
-                   help="Allow exporting a bf16-phase (non-QAT) checkpoint. "
-                        "By default the exporter refuses these because "
-                        "ternarizing them silently degrades deployment quality. "
-                        "Use only for diagnostic exports.")
+    p.add_argument("--allow-bf16-phase", action="store_true")
+    p.add_argument("--fp16-embed", action="store_true",
+                   help="Write meaning/intuition embeddings as fp16 (half size, "
+                        "lossless on val PPL). Bumps magic to HTMOE004.")
+    p.add_argument("--no-meaning", action="store_true",
+                   help="Skip meaning_embed (assume reader will load it from "
+                        "a shared file produced by --meaning-out). "
+                        "Bumps magic to HTMOE004.")
+    p.add_argument("--meaning-out",
+                   help="Instead of exporting the full model, write ONLY the "
+                        "meaning_embed to this path as a shared MNGSHR04 file.")
     args = p.parse_args()
-    export_model(args.ckpt, args.out, packed=not args.legacy,
-                 allow_bf16_phase=args.allow_bf16_phase)
+    if args.meaning_out:
+        export_meaning_shared(args.ckpt, args.meaning_out)
+    else:
+        export_model(args.ckpt, args.out, packed=not args.legacy,
+                     allow_bf16_phase=args.allow_bf16_phase,
+                     fp16_embeddings=args.fp16_embed,
+                     skip_meaning=args.no_meaning)

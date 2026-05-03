@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>TinyHetMoE v7 — Stitched (6 experts, full Qwen vocab)</title>
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    /* v7 stitch styles. Mirrors stitch.html but with 6 experts. */
+    .stitch-main { max-width: 1080px; margin: 24px auto; padding: 0 16px; }
+    .stitch-status { font-family: monospace; font-size: 13px; color: var(--ink-mute); margin-bottom: 12px; }
+    .stitch-status.error { color: #d65a2c; }
+
+    .controls {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px 24px;
+      padding: 12px;
+      border: 1px solid var(--rule);
+      border-radius: 6px;
+      background: var(--surface-1);
+      margin-bottom: 18px;
+    }
+    .controls label { font-size: 13px; }
+    .controls .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .controls .row strong { min-width: 90px; font-weight: 600; font-size: 13px; }
+    .controls input[type="number"], .controls select, .controls input[type="text"] {
+      padding: 4px 6px; border: 1px solid var(--rule); border-radius: 4px;
+      font-family: monospace; font-size: 13px; background: var(--surface-0);
+    }
+    .controls input[type="text"] { flex: 1; min-width: 200px; }
+    .controls button {
+      padding: 6px 12px; background: var(--ink); color: var(--surface-0);
+      border: none; border-radius: 4px; cursor: pointer; font-size: 13px;
+      font-family: inherit;
+    }
+    .controls button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .controls button.secondary { background: var(--surface-2); color: var(--ink); }
+
+    .output {
+      border: 1px solid var(--rule); border-radius: 6px; padding: 18px;
+      min-height: 200px; background: var(--surface-0);
+      font-family: Georgia, serif; font-size: 16px; line-height: 1.7;
+      white-space: pre-wrap;
+    }
+    .output .tok {
+      display: inline; padding: 1px 0; border-bottom: 3px solid transparent;
+      transition: background 0.1s, border-color 0.1s;
+    }
+    /* Six-expert palette: pick distinct hues but keep them muted. */
+    .output .tok.expert-0 { border-bottom-color: #4a8fbb; }  /* general — blue */
+    .output .tok.expert-1 { border-bottom-color: #c59c4f; }  /* thinker — gold */
+    .output .tok.expert-2 { border-bottom-color: #6f9c4d; }  /* code_py — green */
+    .output .tok.expert-3 { border-bottom-color: #8b5fb4; }  /* code_js — purple */
+    .output .tok.expert-4 { border-bottom-color: #c2603e; }  /* medical — orange */
+    .output .tok.expert-5 { border-bottom-color: #777777; }  /* legal — gray */
+    .output .tok.prompt   { background: var(--surface-1); border-bottom-color: transparent; }
+
+    .legend { display: flex; gap: 16px; margin-top: 8px; font-size: 12px; color: var(--ink-mute); flex-wrap: wrap; }
+    .legend-swatch { display: inline-block; width: 20px; height: 4px; vertical-align: middle; margin-right: 4px; }
+    .legend-0 { background: #4a8fbb; }
+    .legend-1 { background: #c59c4f; }
+    .legend-2 { background: #6f9c4d; }
+    .legend-3 { background: #8b5fb4; }
+    .legend-4 { background: #c2603e; }
+    .legend-5 { background: #777777; }
+
+    .stats { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 12px; font-family: monospace; font-size: 12px; color: var(--ink-mute); }
+    .stats span { display: inline-block; }
+
+    .trace {
+      margin-top: 18px; max-height: 220px; overflow-y: auto;
+      font-family: monospace; font-size: 12px; color: var(--ink-mute);
+      border: 1px solid var(--rule); border-radius: 4px; padding: 8px;
+      background: var(--surface-1);
+    }
+    .trace .row { display: flex; gap: 12px; padding: 1px 0; }
+    .trace .row .pos { width: 40px; opacity: 0.6; }
+    .trace .row .expert-0 { color: #4a8fbb; }
+    .trace .row .expert-1 { color: #c59c4f; }
+    .trace .row .expert-2 { color: #6f9c4d; }
+    .trace .row .expert-3 { color: #8b5fb4; }
+    .trace .row .expert-4 { color: #c2603e; }
+    .trace .row .expert-5 { color: #777777; }
+    .trace .row .conf { width: 90px; }
+    .trace .row .probs { flex: 1; opacity: 0.7; }
+    .trace .row.warmup { color: #aa7733; }
+
+    .info-banner {
+      padding: 10px 14px;
+      border: 1px solid var(--rule);
+      background: var(--surface-1);
+      border-radius: 6px;
+      margin-bottom: 12px;
+      font-size: 13px;
+      color: var(--ink-mute);
+    }
+    .info-banner strong { color: var(--ink); }
+  </style>
+</head>
+<body class="prose-page">
+  <header class="topbar">
+    <div class="topbar-left">
+      <h1><a href="./">TinyHetMoE<span class="logo-dot">.</span></a> <span class="page-tag">/ stitched v7</span></h1>
+      <span class="subtitle">
+        Six 114M-param ternary experts (general / thinker / code_py / code_js /
+        medical / legal), each distilled from Qwen 2.5 0.5B-class teachers, with
+        per-token routing through a frozen meaning-axis classifier. Full Qwen
+        vocab (151,665 tokens). Bundle ~400 MB; first load ~110 MB.
+      </span>
+    </div>
+    <div class="topbar-right">
+      <a href="./" class="meta-chip nav-chip">← demo</a>
+      <a href="stitch.html" class="meta-chip nav-chip">v6 stitch</a>
+      <a href="blog.html" class="meta-chip nav-chip">blog</a>
+      <a href="journal.html" class="meta-chip nav-chip">journal</a>
+    </div>
+  </header>
+
+  <main class="stitch-main">
+    <div id="status" class="stitch-status">Booting…</div>
+
+    <div class="info-banner">
+      <strong>What this is:</strong> a single page running 6 ternary experts in WASM,
+      with token-level routing decided live by a classifier on the frozen
+      meaning embedding. Color under each token = which expert produced it.
+    </div>
+
+    <div class="controls">
+      <div class="row" style="grid-column: 1 / -1;">
+        <strong>Prompt</strong>
+        <input type="text" id="prompt-input" placeholder="Type a prompt — try chat, math, code, or medical…"
+               value="The capital of France is">
+        <button id="run-btn" disabled>Generate</button>
+        <button id="reset-btn" class="secondary">Reset</button>
+      </div>
+      <div class="row" style="grid-column: 1 / -1;">
+        <strong>Examples</strong>
+        <button class="secondary example-btn" data-text="The capital of France is">Geo fact</button>
+        <button class="secondary example-btn" data-text="Question: If a train leaves at 3pm going 60 mph, where is it at 5pm?&#10;&#10;Answer:">Math</button>
+        <button class="secondary example-btn" data-text="def fibonacci(n):&#10;    if n &lt; 2:&#10;        return n&#10;    return">Python</button>
+        <button class="secondary example-btn" data-text="function fibonacci(n) {&#10;  if (n &lt; 2) return n;&#10;  return">JavaScript</button>
+        <button class="secondary example-btn" data-text="Question: What are the symptoms of pneumonia?&#10;&#10;Answer:">Medical</button>
+        <button class="secondary example-btn" data-text="Question: What is the difference between civil and criminal law?&#10;&#10;Answer:">Legal</button>
+      </div>
+
+      <div class="row" style="grid-column: 1 / -1;">
+        <strong>Routing</strong>
+        <label><input type="radio" name="route-mode" value="classifier" checked> Classifier</label>
+        <label><input type="radio" name="route-mode" value="0"> general</label>
+        <label><input type="radio" name="route-mode" value="1"> thinker</label>
+        <label><input type="radio" name="route-mode" value="2"> code_py</label>
+        <label><input type="radio" name="route-mode" value="3"> code_js</label>
+        <label><input type="radio" name="route-mode" value="4"> medical</label>
+        <label><input type="radio" name="route-mode" value="5"> legal</label>
+      </div>
+
+      <div class="row">
+        <strong>Sampling</strong>
+        <label>temp <input type="number" id="temp" value="0.7" step="0.1" min="0" max="2" style="width: 60px;"></label>
+        <label>top-k <input type="number" id="top-k" value="40" step="5" min="1" max="200" style="width: 60px;"></label>
+        <label>tokens <input type="number" id="n-gen" value="60" step="10" min="10" max="300" style="width: 70px;"></label>
+        <label>seed <input type="number" id="seed" value="42" style="width: 80px;"></label>
+      </div>
+
+      <div class="row">
+        <strong>Latency sim</strong>
+        <label><input type="radio" name="latency" value="0" checked> Off</label>
+        <label><input type="radio" name="latency" value="5"> LAN (~5ms)</label>
+        <label><input type="radio" name="latency" value="50"> WAN (~50ms)</label>
+      </div>
+    </div>
+
+    <div id="output" class="output">
+      <em style="color: var(--ink-mute);">Generated text will appear here.</em>
+    </div>
+
+    <div class="legend">
+      <span><span class="legend-swatch legend-0"></span>general</span>
+      <span><span class="legend-swatch legend-1"></span>thinker</span>
+      <span><span class="legend-swatch legend-2"></span>code_py</span>
+      <span><span class="legend-swatch legend-3"></span>code_js</span>
+      <span><span class="legend-swatch legend-4"></span>medical</span>
+      <span><span class="legend-swatch legend-5"></span>legal</span>
+    </div>
+
+    <div id="stats" class="stats"></div>
+
+    <div id="trace" class="trace"></div>
+  </main>
+
+  <script type="module" src="stitch_v7.js"></script>
+</body>
+</html>

@@ -34,19 +34,93 @@ pub mod wasm_api;
 #[cfg(feature = "wasm")]
 pub mod wasm_api_stitch;
 
+/// Read a shared MNGSHR04 file → (vocab_size, meaning_dim, fp32 weights).
+/// Browser downloads this once across all 6 experts since meaning_embed
+/// is frozen and identical.
+pub fn load_shared_meaning_from_bytes(file_data: Vec<u8>) -> std::io::Result<(usize, usize, Vec<f32>)> {
+    let mut cursor = Cursor::new(file_data);
+    let mut magic = [0u8; 8];
+    cursor.read_exact(&mut magic)?;
+    if &magic != b"MNGSHR04" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Expected magic MNGSHR04, got {:?}", magic),
+        ));
+    }
+    let vocab_size = cursor.read_u32::<LittleEndian>()? as usize;
+    let meaning_dim = cursor.read_u32::<LittleEndian>()? as usize;
+    let count = vocab_size * meaning_dim;
+    let mut weights = vec![0.0f32; count];
+    for v in weights.iter_mut() {
+        let h = cursor.read_u16::<LittleEndian>()?;
+        *v = f16_to_f32(h);
+    }
+    Ok((vocab_size, meaning_dim, weights))
+}
+
+/// IEEE 754 binary16 → f32. Matches `numpy.float16.astype(np.float32)`.
+fn f16_to_f32(h: u16) -> f32 {
+    // Sign / exponent / mantissa from the 16-bit half
+    let sign = (h >> 15) & 0x1;
+    let exp  = (h >> 10) & 0x1f;
+    let frac = h & 0x3ff;
+
+    let bits = if exp == 0 {
+        if frac == 0 {
+            // signed zero
+            (sign as u32) << 31
+        } else {
+            // subnormal half → normalize as f32
+            let mut e: i32 = -14;
+            let mut m: u32 = frac as u32;
+            while (m & 0x400) == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            m &= 0x3ff;
+            let exp32 = ((e + 127) as u32) & 0xff;
+            ((sign as u32) << 31) | (exp32 << 23) | (m << 13)
+        }
+    } else if exp == 0x1f {
+        // Inf / NaN
+        ((sign as u32) << 31) | 0x7f800000 | ((frac as u32) << 13)
+    } else {
+        let exp32 = (exp as i32 - 15 + 127) as u32;
+        ((sign as u32) << 31) | (exp32 << 23) | ((frac as u32) << 13)
+    };
+    f32::from_bits(bits)
+}
+
 /// Top-level model loader. Reads bytes (file contents in native, or
 /// JS-supplied ArrayBuffer in WASM) and returns a Model ready to infer.
+///
+/// Supports magics:
+///   HTMOE002: int8 ternary,    fp32 embeds, includes meaning_embed
+///   HTMOE003: 2-bit ternary,   fp32 embeds, includes meaning_embed
+///   HTMOE004: 2-bit ternary,   fp16 embeds, MAY skip meaning_embed
+///             (in which case caller supplies it via shared_meaning)
+///
+/// `shared_meaning`: required when the file is HTMOE004 (which always
+/// uses an external shared meaning). Ignored for HTMOE002/003.
 pub fn load_model_from_bytes(file_data: Vec<u8>) -> std::io::Result<Model> {
+    load_model_from_bytes_with_meaning(file_data, None)
+}
+
+pub fn load_model_from_bytes_with_meaning(
+    file_data: Vec<u8>,
+    shared_meaning: Option<Vec<f32>>,
+) -> std::io::Result<Model> {
     let mut cursor = Cursor::new(file_data);
 
     let mut magic = [0u8; 8];
     cursor.read_exact(&mut magic)?;
-    let packed = match &magic {
-        b"HTMOE002" => false,                  // legacy: 1 byte / weight
-        b"HTMOE003" => true,                   // packed: 2 bits / weight (4 per byte)
+    let (packed, fp16_embeds) = match &magic {
+        b"HTMOE002" => (false, false),         // legacy: 1 byte / weight, fp32 embeds
+        b"HTMOE003" => (true,  false),         // packed: 2 bits / weight, fp32 embeds
+        b"HTMOE004" => (true,  true),          // packed + fp16 embeds, optional shared meaning
         _ => return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("Expected magic HTMOE002 or HTMOE003, got {:?}", magic),
+            format!("Expected magic HTMOE002/003/004, got {:?}", magic),
         )),
     };
 
@@ -84,9 +158,37 @@ pub fn load_model_from_bytes(file_data: Vec<u8>) -> std::io::Result<Model> {
         }
     }
 
-    // M+I embeddings (FP32)
-    let meaning_embed   = read_fp32(&mut cursor, config.vocab_size * config.meaning_dim)?;
-    let intuition_embed = read_fp32(&mut cursor, config.vocab_size * config.intuition_dim)?;
+    // M+I embeddings.
+    //   HTMOE002/003: fp32, both meaning + intuition in the file.
+    //   HTMOE004:     fp16, meaning is supplied externally (shared file).
+    //                       The file contains intuition only; reader gets
+    //                       meaning from `shared_meaning` arg.
+    let meaning_embed = if fp16_embeds {
+        // HTMOE004: meaning is external
+        let m = shared_meaning.ok_or_else(|| std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HTMOE004 file requires `shared_meaning` to be supplied; \
+             load via load_shared_meaning_from_bytes() first",
+        ))?;
+        let expected = config.vocab_size * config.meaning_dim;
+        if m.len() != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "shared_meaning length {} does not match vocab*meaning_dim = {}",
+                    m.len(), expected
+                ),
+            ));
+        }
+        m
+    } else {
+        read_fp32(&mut cursor, config.vocab_size * config.meaning_dim)?
+    };
+    let intuition_embed = if fp16_embeds {
+        read_fp16_as_fp32(&mut cursor, config.vocab_size * config.intuition_dim)?
+    } else {
+        read_fp32(&mut cursor, config.vocab_size * config.intuition_dim)?
+    };
 
     // Highway expand
     let expand = read_ternary(&mut cursor, packed)?;
@@ -149,6 +251,27 @@ pub fn load_model_from_bytes(file_data: Vec<u8>) -> std::io::Result<Model> {
     })
 }
 
+
+/// HTMOE004 embedding: u32 count, count*f16 little-endian.
+/// Cast to fp32 on read (model uses fp32 internally; ~2× memory blow-up
+/// at load time, but storage on disk / over the wire is fp16).
+fn read_fp16_as_fp32(
+    cursor: &mut Cursor<Vec<u8>>, expected_count: usize,
+) -> std::io::Result<Vec<f32>> {
+    let count = cursor.read_u32::<LittleEndian>()? as usize;
+    if count != expected_count {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("FP16 count mismatch: expected {}, got {}", expected_count, count),
+        ));
+    }
+    let mut data = vec![0.0f32; count];
+    for v in data.iter_mut() {
+        let h = cursor.read_u16::<LittleEndian>()?;
+        *v = f16_to_f32(h);
+    }
+    Ok(data)
+}
 
 fn read_fp32(cursor: &mut Cursor<Vec<u8>>, expected_count: usize) -> std::io::Result<Vec<f32>> {
     let count = cursor.read_u32::<LittleEndian>()? as usize;

@@ -11,6 +11,8 @@ use wasm_bindgen::prelude::*;
 
 use crate::{
     load_model_from_bytes,
+    load_model_from_bytes_with_meaning,
+    load_shared_meaning_from_bytes,
     stitch::{DomainClassifier, RouteMode, StitchExpert, StitchedEngine},
 };
 
@@ -75,9 +77,17 @@ impl WasmStitchedEngine {
         let parsed_obj: js_sys::Object = parsed.into();
 
         let format_version = get_string(&parsed_obj, "format_version")?;
-        if format_version != "STITCH001" {
+        if format_version != "STITCH001" && format_version != "STITCHV7_001" {
             return Err(JsValue::from_str(&format!(
                 "unsupported stitch format_version: {}", format_version)));
+        }
+        // V7 (STITCHV7_001) uses a different classifier shape — see new_v7().
+        // The legacy `new()` constructor still expects v6's STITCH001 layout.
+        if format_version == "STITCHV7_001" {
+            return Err(JsValue::from_str(
+                "STITCHV7_001 stitch.json — call WasmStitchedEngine.new_v7() \
+                 instead of constructor (different signature, requires \
+                 meaning_shared bytes)"));
         }
         let ema_alpha = get_f32(&parsed_obj, "ema_alpha")?;
         let meaning_dim = get_u32(&parsed_obj, "meaning_dim")? as usize;
@@ -121,6 +131,105 @@ impl WasmStitchedEngine {
             .into();
         let _hidden = get_u32(&clf_obj, "hidden")? as usize;
         let _k = get_u32(&clf_obj, "k")? as usize;
+        let w1 = get_f32_array(&clf_obj, "w1")?;
+        let b1 = get_f32_array(&clf_obj, "b1")?;
+        let w2 = get_f32_array(&clf_obj, "w2")?;
+        let b2 = get_f32_array(&clf_obj, "b2")?;
+        let feat_mu = get_f32_array(&clf_obj, "feat_mu")?;
+        let feat_sd = get_f32_array(&clf_obj, "feat_sd")?;
+        let clf = DomainClassifier::new(
+            w1, b1, w2, b2, feat_mu, feat_sd, meaning_dim, ema_alpha,
+        );
+
+        let engine = StitchedEngine::new(experts, clf);
+        Ok(WasmStitchedEngine { engine, expert_names })
+    }
+
+    /// V7 constructor.
+    ///
+    /// Accepts a flat byte buffer containing meaning_shared.bin followed
+    /// by N expert bins, with offsets describing slices.
+    /// `bin_offsets` is length N+2:
+    ///   - offsets[0] = 0
+    ///   - offsets[1] = end of meaning_shared (= start of expert 0)
+    ///   - offsets[2..N+2] = end of expert i (= start of expert i+1)
+    ///
+    /// Note: meaning is loaded ONCE and shared across all experts via
+    /// `load_model_from_bytes_with_meaning`. Each expert .bin uses HTMOE004
+    /// (fp16 intuition only).
+    ///
+    /// V7 stitch.json schema differs from v6:
+    ///   - format_version: "STITCHV7_001"
+    ///   - classifier.input_dim, classifier.hidden, classifier.output_dim,
+    ///     classifier.domains, classifier.{w1,b1,w2,b2,feat_mu,feat_sd}
+    ///   - experts[i].masked_tids may be absent (default empty)
+    pub fn new_v7(
+        flat_bytes: Vec<u8>,
+        bin_offsets: Vec<u32>,    // length N+2
+        stitch_json: String,
+    ) -> Result<WasmStitchedEngine, JsValue> {
+        let parsed = js_sys::JSON::parse(&stitch_json)
+            .map_err(|e| JsValue::from_str(&format!("stitch.json parse failed: {:?}", e)))?;
+        let parsed_obj: js_sys::Object = parsed.into();
+
+        let format_version = get_string(&parsed_obj, "format_version")?;
+        if format_version != "STITCHV7_001" {
+            return Err(JsValue::from_str(&format!(
+                "new_v7 requires STITCHV7_001 stitch.json, got {}", format_version)));
+        }
+        let ema_alpha = get_f32(&parsed_obj, "ema_alpha")?;
+        let meaning_dim = get_u32(&parsed_obj, "meaning_dim")? as usize;
+
+        let experts_arr = get_array(&parsed_obj, "experts")?;
+        let n_experts = experts_arr.length() as usize;
+        // bin_offsets layout: [0, end_of_meaning, end_of_expert0, ..., end_of_expert{N-1}]
+        if bin_offsets.len() != n_experts + 2 {
+            return Err(JsValue::from_str(&format!(
+                "bin_offsets length {} != n_experts {}+2",
+                bin_offsets.len(), n_experts)));
+        }
+
+        // Slice 0: shared meaning
+        let meaning_lo = bin_offsets[0] as usize;
+        let meaning_hi = bin_offsets[1] as usize;
+        let meaning_slice = flat_bytes[meaning_lo..meaning_hi].to_vec();
+        let (_v, _d, meaning_weights) = load_shared_meaning_from_bytes(meaning_slice)
+            .map_err(|e| JsValue::from_str(&format!("meaning_shared load: {}", e)))?;
+
+        // Each expert uses the shared meaning
+        let mut experts = Vec::with_capacity(n_experts);
+        let mut expert_names = Vec::with_capacity(n_experts);
+        for i in 0..n_experts {
+            let entry: js_sys::Object = experts_arr.get(i as u32).into();
+            let name = get_string(&entry, "name")?;
+            // masked_tids optional in v7 stitch.json
+            let masked_tids = match js_sys::Reflect::get(&entry, &"masked_tids".into()) {
+                Ok(v) if js_sys::Array::is_array(&v) => {
+                    let arr: js_sys::Array = v.into();
+                    let mut t = Vec::with_capacity(arr.length() as usize);
+                    for j in 0..arr.length() {
+                        let n = arr.get(j).as_f64().unwrap_or(0.0) as u32;
+                        t.push(n);
+                    }
+                    t
+                }
+                _ => Vec::new(),
+            };
+
+            let lo = bin_offsets[i + 1] as usize;
+            let hi = bin_offsets[i + 2] as usize;
+            let slice = flat_bytes[lo..hi].to_vec();
+            let model = load_model_from_bytes_with_meaning(slice, Some(meaning_weights.clone()))
+                .map_err(|e| JsValue::from_str(&format!(
+                    "expert '{}' load error: {}", name, e)))?;
+            experts.push(StitchExpert::new(name.clone(), model, masked_tids));
+            expert_names.push(name);
+        }
+
+        // V7 classifier: w1 is hidden×input_dim (132), w2 is K×hidden
+        let clf_obj: js_sys::Object = js_sys::Reflect::get(&parsed_obj, &"classifier".into())
+            .map_err(|_| JsValue::from_str("missing classifier in stitch.json"))?
+            .into();
         let w1 = get_f32_array(&clf_obj, "w1")?;
         let b1 = get_f32_array(&clf_obj, "b1")?;
         let w2 = get_f32_array(&clf_obj, "w2")?;

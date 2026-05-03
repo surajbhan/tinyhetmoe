@@ -13,7 +13,7 @@ use crate::{
     load_model_from_bytes,
     load_model_from_bytes_with_meaning,
     load_shared_meaning_from_bytes,
-    stitch::{DomainClassifier, RouteMode, StitchExpert, StitchedEngine},
+    stitch::{DomainClassifier, StitchExpert, StitchedEngine},
 };
 
 /// One step's output, mirrored for JS consumption.
@@ -25,6 +25,9 @@ pub struct WasmStitchStep {
     logits: Vec<f32>,
     warmup_happened: bool,
     warmup_tokens: u32,
+    /// 0xFFFFFFFF = no pending; otherwise the classifier wanted this expert
+    /// idx but it wasn't loaded; engine fell back to chosen_expert.
+    pending_expert: u32,
 }
 
 #[wasm_bindgen]
@@ -35,6 +38,10 @@ impl WasmStitchStep {
     #[wasm_bindgen(getter)] pub fn logits(&self) -> Vec<f32> { self.logits.clone() }
     #[wasm_bindgen(getter)] pub fn warmup_happened(&self) -> bool { self.warmup_happened }
     #[wasm_bindgen(getter)] pub fn warmup_tokens(&self) -> u32 { self.warmup_tokens }
+    #[wasm_bindgen(getter)] pub fn pending_expert(&self) -> i32 {
+        // -1 = none, otherwise classifier idx. JS-friendly than u32::MAX.
+        if self.pending_expert == u32::MAX { -1 } else { self.pending_expert as i32 }
+    }
 }
 
 /// Stitched-engine handle exposed to JS.
@@ -244,6 +251,138 @@ impl WasmStitchedEngine {
         Ok(WasmStitchedEngine { engine, expert_names })
     }
 
+    /// V7 LAZY constructor.
+    ///
+    /// Construct an engine with the shared meaning + classifier from
+    /// stitch.json, but ZERO experts loaded. Caller fetches each expert
+    /// .bin lazily and calls `add_expert_lazy(name, bytes)` to load it.
+    /// Engine still produces `step()` results; if classifier picks an
+    /// unloaded expert, `step.pending_expert` reports which idx, and the
+    /// engine falls back to the first loaded expert for output.
+    pub fn new_v7_lazy(
+        meaning_bytes: Vec<u8>,
+        stitch_json: String,
+    ) -> Result<WasmStitchedEngine, JsValue> {
+        let parsed = js_sys::JSON::parse(&stitch_json)
+            .map_err(|e| JsValue::from_str(&format!("stitch.json parse: {:?}", e)))?;
+        let parsed_obj: js_sys::Object = parsed.into();
+        let format_version = get_string(&parsed_obj, "format_version")?;
+        if format_version != "STITCHV7_001" {
+            return Err(JsValue::from_str(&format!(
+                "new_v7_lazy needs STITCHV7_001 stitch.json, got {}", format_version)));
+        }
+        let ema_alpha = get_f32(&parsed_obj, "ema_alpha")?;
+        let meaning_dim = get_u32(&parsed_obj, "meaning_dim")? as usize;
+        let vocab_size = get_u32(&parsed_obj, "vocab_size")? as usize;
+
+        // Load shared meaning
+        let (mv, md, meaning_weights) = load_shared_meaning_from_bytes(meaning_bytes)
+            .map_err(|e| JsValue::from_str(&format!("meaning_shared: {}", e)))?;
+        if mv != vocab_size || md != meaning_dim {
+            return Err(JsValue::from_str(&format!(
+                "meaning_shared shape ({},{}) doesn't match stitch.json (V={},D={})",
+                mv, md, vocab_size, meaning_dim)));
+        }
+
+        // Classifier
+        let clf_obj: js_sys::Object = js_sys::Reflect::get(&parsed_obj, &"classifier".into())
+            .map_err(|_| JsValue::from_str("missing classifier"))?
+            .into();
+        let w1 = get_f32_array(&clf_obj, "w1")?;
+        let b1 = get_f32_array(&clf_obj, "b1")?;
+        let w2 = get_f32_array(&clf_obj, "w2")?;
+        let b2 = get_f32_array(&clf_obj, "b2")?;
+        let feat_mu = get_f32_array(&clf_obj, "feat_mu")?;
+        let feat_sd = get_f32_array(&clf_obj, "feat_sd")?;
+        let clf = DomainClassifier::new(
+            w1, b1, w2, b2, feat_mu, feat_sd, meaning_dim, ema_alpha,
+        );
+
+        // Pull expert names from manifest in classifier-output order
+        let domains_arr = get_array(&clf_obj, "domains")?;
+        let mut expert_names = Vec::with_capacity(domains_arr.length() as usize);
+        for i in 0..domains_arr.length() {
+            let v = domains_arr.get(i).as_string()
+                .ok_or_else(|| JsValue::from_str("classifier.domains[i] not string"))?;
+            expert_names.push(v);
+        }
+
+        let engine = StitchedEngine::new_lazy(
+            clf, meaning_weights, meaning_dim, vocab_size,
+        );
+        Ok(WasmStitchedEngine { engine, expert_names })
+    }
+
+    /// Lazy-load: insert an expert at the given classifier-index slot.
+    /// `expert_idx` is the classifier output position (0..K). Bytes is
+    /// the HTMOE004 .bin (without meaning_embed; engine supplies shared).
+    pub fn add_expert_lazy(
+        &mut self,
+        expert_idx: u32,
+        expert_bytes: Vec<u8>,
+    ) -> Result<(), JsValue> {
+        let idx = expert_idx as usize;
+        if idx >= self.expert_names.len() {
+            return Err(JsValue::from_str(&format!(
+                "expert_idx {} >= num expert slots {}",
+                idx, self.expert_names.len())));
+        }
+        let name = self.expert_names[idx].clone();
+        // Reuse the engine's shared meaning_embed.
+        let model = load_model_from_bytes_with_meaning(
+            expert_bytes, Some(self.engine.meaning_embed.clone()),
+        ).map_err(|e| JsValue::from_str(&format!(
+            "expert '{}' load: {}", name, e)))?;
+        let expert = StitchExpert::new(name, model, Vec::new());
+        self.engine.add_expert_at(idx, expert);
+        Ok(())
+    }
+
+    /// Is expert at classifier idx loaded?
+    pub fn is_loaded(&self, idx: u32) -> bool {
+        self.engine.is_loaded(idx as usize)
+    }
+
+    /// Peek what expert the classifier WOULD pick for `token` without
+    /// committing the token to history or running a forward. Returns the
+    /// intended (post-sticky) expert idx. Use to pre-fetch experts
+    /// before calling step().
+    pub fn peek_expert(&self, token: u32) -> u32 {
+        let (idx, _probs, _margin) = self.engine.peek_step(token);
+        idx as u32
+    }
+
+    /// Set the sticky-routing threshold. Higher = harder to switch experts
+    /// once locked in. Default 0.3. Range [0, 1].
+    pub fn set_switch_threshold(&mut self, t: f32) {
+        self.engine.set_switch_threshold(t);
+    }
+
+    /// Set the classifier-input blend ratio between flat-window mean and
+    /// attention pool. 0.0 = pure attention (reactive but can over-respond
+    /// to surface noise), 1.0 = pure flat mean (stable but slow to drift).
+    /// Default 0.5. Range [0, 1].
+    pub fn set_flat_blend(&mut self, t: f32) {
+        let v = t.clamp(0.0, 1.0);
+        self.engine.classifier.flat_blend = v;
+    }
+    #[wasm_bindgen(getter)]
+    pub fn flat_blend(&self) -> f32 {
+        self.engine.classifier.flat_blend
+    }
+
+    // Note: there used to be `freeze_classifier()` here when we had an
+    // EMA-based classifier. The classifier now uses a flat sliding-window
+    // mean over the last 64 meaning vectors, which provides stickiness
+    // naturally — no freeze hack needed. The window keeps the prompt's
+    // domain signal load-bearing for ~30+ generation tokens before it
+    // averages out, while still allowing genuine drift on cross-domain
+    // generations.
+
+    /// Number of currently-loaded experts (rest are lazy slots).
+    #[wasm_bindgen(getter)]
+    pub fn loaded_count(&self) -> u32 { self.engine.loaded_count() as u32 }
+
     pub fn step(&mut self, token: u32) -> WasmStitchStep {
         let s = self.engine.step(token);
         WasmStitchStep {
@@ -253,6 +392,7 @@ impl WasmStitchedEngine {
             logits: s.logits,
             warmup_happened: s.warmup_happened,
             warmup_tokens: s.warmup_tokens as u32,
+            pending_expert: s.pending_expert.map(|i| i as u32).unwrap_or(u32::MAX),
         }
     }
 
@@ -282,7 +422,7 @@ impl WasmStitchedEngine {
 
     #[wasm_bindgen(getter)]
     pub fn vocab_size(&self) -> u32 {
-        self.engine.experts[0].config().vocab_size as u32
+        self.engine.vocab_size as u32
     }
 
     #[wasm_bindgen(getter)]

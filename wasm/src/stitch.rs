@@ -59,7 +59,18 @@ impl StitchExpert {
 }
 
 /// Frozen 132 → hidden → K classifier with per-feature z-score normalization
-/// and an EMA over meaning vectors.
+/// and a sliding-window mean over the last `window_size` meaning vectors.
+///
+/// Why a flat window instead of an EMA: an EMA with α=0.05 has effective
+/// memory of ~20 tokens, which means after a short prompt the EMA drifts
+/// to the running generation and the classifier follows the model's
+/// hallucinations rather than the user's intent. A flat window of N=64
+/// tokens keeps the prompt's domain signal load-bearing for many more
+/// generation steps, while still allowing genuine domain drift when the
+/// generation produces enough cross-domain content to flip the average.
+///
+/// We KEEP `ema_alpha` in the struct for back-compat with stitch.json
+/// schemas that include it — but the math now uses a sliding window.
 pub struct DomainClassifier {
     pub w1: Vec<f32>,         // hidden × 132
     pub b1: Vec<f32>,         // hidden
@@ -70,8 +81,22 @@ pub struct DomainClassifier {
     pub hidden: usize,
     pub k: usize,
     pub meaning_dim: usize,
-    pub ema: Vec<f32>,        // 132 — running EMA, reset on engine reset
-    pub ema_alpha: f32,
+    /// Ring-buffer of the last `window_size` meaning vectors (each `meaning_dim` long).
+    /// Stored flat: rows are window positions, cols are meaning dims.
+    pub window: Vec<f32>,
+    pub window_size: usize,
+    /// How many of the window slots are filled. Caps at `window_size`.
+    pub filled: usize,
+    /// Index where the next push goes. Wraps modulo `window_size`.
+    pub head: usize,
+    pub ema_alpha: f32,       // unused at runtime; kept for stitch.json compat
+    /// Cached classifier-input mean across the window. Updated on every push.
+    pub ema: Vec<f32>,
+    /// Blend weight: classifier feature = flat_blend·flat_mean + (1-flat_blend)·attention_pool.
+    /// 0.0 = pure attention (most reactive, can over-respond to single
+    /// hallucinated tokens); 1.0 = pure flat mean (most stable, equivalent
+    /// to the old uniform-window behavior). Default 0.5.
+    pub flat_blend: f32,
 }
 
 impl DomainClassifier {
@@ -84,25 +109,114 @@ impl DomainClassifier {
     ) -> Self {
         let hidden = b1.len();
         let k = b2.len();
+        // Flat sliding-window over the last 64 meaning vectors. 64 is
+        // long enough to keep prompt context load-bearing during ~30
+        // generated tokens, short enough that genuine domain drift
+        // eventually flips the route.
+        const WINDOW_SIZE: usize = 64;
         Self {
             w1, b1, w2, b2, feat_mu, feat_sd,
             hidden, k, meaning_dim,
-            ema: vec![0.0; meaning_dim],
+            window: vec![0.0; meaning_dim * WINDOW_SIZE],
+            window_size: WINDOW_SIZE,
+            filled: 0,
+            head: 0,
             ema_alpha,
+            ema: vec![0.0; meaning_dim],
+            flat_blend: 0.5,
         }
     }
 
-    /// Update EMA with the new token's meaning vector.
+    /// Push a new meaning vector into the sliding window and recompute
+    /// the classifier input as a **blend of attention pool + flat mean**.
+    ///
+    /// Two pieces:
+    ///   - **Flat mean**: average over all filled window slots. Anchors
+    ///     decisions in the overall window content (e.g. a JS prompt
+    ///     keeps voting JS even when the model emits math-flavored
+    ///     hallucinations). Stable, slow to drift.
+    ///   - **Attention pool**: query = current token's meaning;
+    ///     keys/values = each PRIOR slot in the window (self-attention
+    ///     masked). Captures "what kind of token is this, given similar
+    ///     past tokens." Reactive, picks up genuine domain shifts.
+    ///
+    /// Final feature = FLAT_BLEND·flat + (1 - FLAT_BLEND)·attention.
+    /// At 0.5 the two contribute equally; the prompt context never
+    /// fully drops out, but the attention pool can still flag genuine
+    /// drift when generation crosses domains.
     pub fn update_ema(&mut self, meaning: &[f32]) {
-        let decay = 1.0 - self.ema_alpha;
+        let flat_blend = self.flat_blend;
+
+        let new_slot = self.head;
+
+        // Push the new vector into the head slot
+        let off = new_slot * self.meaning_dim;
         for i in 0..self.meaning_dim {
-            self.ema[i] = decay * self.ema[i] + self.ema_alpha * meaning[i];
+            self.window[off + i] = meaning[i];
+        }
+        self.head = (self.head + 1) % self.window_size;
+        if self.filled < self.window_size {
+            self.filled += 1;
+        }
+
+        let dim = self.meaning_dim;
+
+        // First-token corner case: just use the new vector directly.
+        if self.filled == 1 {
+            for d in 0..dim { self.ema[d] = meaning[d]; }
+            return;
+        }
+
+        // ── Flat mean over ALL filled slots (includes new) ────────────
+        let mut flat = vec![0.0_f32; dim];
+        for slot in 0..self.filled {
+            let s_off = slot * dim;
+            for d in 0..dim { flat[d] += self.window[s_off + d]; }
+        }
+        let inv_n = 1.0 / (self.filled as f32);
+        for d in 0..dim { flat[d] *= inv_n; }
+
+        // ── Attention pool over PRIOR slots (mask self) ───────────────
+        let scale = 1.0 / (dim as f32).sqrt();
+        let mut scores = vec![0.0_f32; self.filled];
+        let mut max_s = f32::NEG_INFINITY;
+        for slot in 0..self.filled {
+            if slot == new_slot { continue; }
+            let s_off = slot * dim;
+            let mut s = 0.0_f32;
+            for d in 0..dim { s += meaning[d] * self.window[s_off + d]; }
+            s *= scale;
+            scores[slot] = s;
+            if s > max_s { max_s = s; }
+        }
+        let mut sum = 0.0_f32;
+        for slot in 0..self.filled {
+            if slot == new_slot { scores[slot] = 0.0; continue; }
+            scores[slot] = (scores[slot] - max_s).exp();
+            sum += scores[slot];
+        }
+        let inv_sum = if sum > 1e-20 { 1.0 / sum } else { 0.0 };
+        for slot in 0..self.filled { scores[slot] *= inv_sum; }
+        let mut attn = vec![0.0_f32; dim];
+        for slot in 0..self.filled {
+            if slot == new_slot { continue; }
+            let w = scores[slot];
+            let s_off = slot * dim;
+            for d in 0..dim { attn[d] += w * self.window[s_off + d]; }
+        }
+
+        // ── Blend ──────────────────────────────────────────────────────
+        for d in 0..dim {
+            self.ema[d] = flat_blend * flat[d] + (1.0 - flat_blend) * attn[d];
         }
     }
 
-    /// Reset EMA to zero. Caller invokes between prompts.
+    /// Reset window to empty. Caller invokes between prompts.
     pub fn reset(&mut self) {
+        for v in self.window.iter_mut() { *v = 0.0; }
         for v in self.ema.iter_mut() { *v = 0.0; }
+        self.filled = 0;
+        self.head = 0;
     }
 
     /// Predict expert. Returns (k probabilities, chosen_idx, confidence).
@@ -168,6 +282,12 @@ pub struct StitchStep {
     pub warmup_happened: bool,
     /// Number of replay tokens during warmup (zero if no warmup).
     pub warmup_tokens: usize,
+    /// If the classifier WANTED an expert that isn't loaded yet, this is
+    /// that expert's index; the engine fell back to `chosen_expert`. The
+    /// caller (JS) should fetch + add_expert(idx) and re-step. Length of
+    /// `classifier_probs` matches num expert SLOTS (= classifier K), not
+    /// num loaded experts.
+    pub pending_expert: Option<usize>,
 }
 
 /// Override mode for routing: classifier-driven (None) or forced.
@@ -176,8 +296,21 @@ pub enum RouteMode {
     Forced(usize),
 }
 
+/// One slot in the engine's expert pool — either filled (model loaded)
+/// or empty (lazy-load not yet completed). `step()` picks the classifier's
+/// argmax slot; if it's empty, falls back to the first filled slot.
+type ExpertSlot = Option<StitchExpert>;
+
 pub struct StitchedEngine {
-    pub experts: Vec<StitchExpert>,
+    /// Indexed by classifier-output idx (length = classifier.k). Each
+    /// slot is None until the JS side fetches + add_expert_at()s it.
+    pub experts: Vec<ExpertSlot>,
+    /// Shared meaning_embed (frozen, same across all 6 experts in v7).
+    /// Held at engine level so we don't depend on having any expert loaded
+    /// to look up token meaning vectors for the classifier.
+    pub meaning_embed: Vec<f32>,
+    pub meaning_dim: usize,
+    pub vocab_size: usize,
     pub classifier: DomainClassifier,
     /// Token history, used for cold-cache warmup replay.
     pub token_history: Vec<u32>,
@@ -195,8 +328,37 @@ pub struct StitchedEngine {
 }
 
 impl StitchedEngine {
+    /// Construct with classifier + shared meaning embedding, but ZERO
+    /// experts. Caller adds experts via `add_expert_at(idx, expert)` as
+    /// they're fetched. v7 entry point.
+    pub fn new_lazy(
+        classifier: DomainClassifier,
+        meaning_embed: Vec<f32>,
+        meaning_dim: usize,
+        vocab_size: usize,
+    ) -> Self {
+        assert_eq!(classifier.meaning_dim, meaning_dim,
+            "classifier meaning_dim must match meaning_embed dim");
+        assert_eq!(meaning_embed.len(), vocab_size * meaning_dim,
+            "meaning_embed size {} != vocab*dim {}",
+            meaning_embed.len(), vocab_size * meaning_dim);
+        let k = classifier.k;
+        let experts: Vec<ExpertSlot> = (0..k).map(|_| None).collect();
+        Self {
+            experts,
+            meaning_embed, meaning_dim, vocab_size,
+            classifier,
+            token_history: Vec::new(),
+            mode: RouteMode::Classifier,
+            last_chosen: None,
+            switch_threshold: 0.3,
+        }
+    }
+
+    /// Legacy v6 entrypoint: takes a non-empty Vec<StitchExpert>, derives
+    /// the shared meaning from experts[0]. Used by the old all-upfront
+    /// constructor in wasm_api_stitch.rs.
     pub fn new(experts: Vec<StitchExpert>, classifier: DomainClassifier) -> Self {
-        // Sanity: all experts must have same vocab + meaning_dim
         assert!(!experts.is_empty(), "need at least one expert");
         let cfg0 = experts[0].config();
         for e in &experts[1..] {
@@ -212,13 +374,43 @@ impl StitchedEngine {
             "classifier output classes ({}) != num experts ({})",
             classifier.k, experts.len());
 
+        let meaning_embed = experts[0].model.meaning_embed.clone();
+        let meaning_dim = cfg0.meaning_dim;
+        let vocab_size = cfg0.vocab_size;
+        let slots: Vec<ExpertSlot> = experts.into_iter().map(Some).collect();
         Self {
-            experts, classifier,
+            experts: slots,
+            meaning_embed, meaning_dim, vocab_size,
+            classifier,
             token_history: Vec::new(),
             mode: RouteMode::Classifier,
             last_chosen: None,
             switch_threshold: 0.3,
         }
+    }
+
+    /// Lazy-load: insert an expert at the given classifier-index slot.
+    pub fn add_expert_at(&mut self, idx: usize, expert: StitchExpert) {
+        assert!(idx < self.experts.len(),
+            "add_expert_at idx {} out of range (k={})", idx, self.experts.len());
+        let cfg = expert.config();
+        assert_eq!(cfg.vocab_size, self.vocab_size, "expert vocab_size mismatch");
+        assert_eq!(cfg.meaning_dim, self.meaning_dim, "expert meaning_dim mismatch");
+        self.experts[idx] = Some(expert);
+    }
+
+    /// True if the classifier slot has a loaded expert.
+    pub fn is_loaded(&self, idx: usize) -> bool {
+        idx < self.experts.len() && self.experts[idx].is_some()
+    }
+
+    /// First loaded slot index, or None if no experts loaded yet.
+    pub fn first_loaded(&self) -> Option<usize> {
+        self.experts.iter().position(|e| e.is_some())
+    }
+
+    pub fn loaded_count(&self) -> usize {
+        self.experts.iter().filter(|e| e.is_some()).count()
     }
 
     pub fn set_switch_threshold(&mut self, t: f32) {
@@ -228,7 +420,9 @@ impl StitchedEngine {
     pub fn num_experts(&self) -> usize { self.experts.len() }
 
     pub fn reset(&mut self) {
-        for e in self.experts.iter_mut() { e.reset(); }
+        for slot in self.experts.iter_mut() {
+            if let Some(e) = slot.as_mut() { e.reset(); }
+        }
         self.classifier.reset();
         self.token_history.clear();
         self.mode = RouteMode::Classifier;
@@ -241,36 +435,162 @@ impl StitchedEngine {
     }
     pub fn unforce(&mut self) { self.mode = RouteMode::Classifier; }
 
-    /// Read a meaning embedding row for token t from the FIRST expert
-    /// (all experts share identical meaning_embed since they share vocab).
+    /// Read a meaning embedding row for token t from the engine's shared
+    /// meaning_embed. Works even when no experts are loaded yet — that's
+    /// the point of holding meaning at engine level.
     fn get_meaning(&self, token: u32) -> &[f32] {
-        let m = &self.experts[0].model.meaning_embed;
-        let dim = self.experts[0].model.config.meaning_dim;
+        let dim = self.meaning_dim;
         let off = token as usize * dim;
-        &m[off .. off + dim]
+        &self.meaning_embed[off .. off + dim]
     }
 
-    /// Catch up a cold expert by replaying tokens it missed. Each replay
-    /// step is one full forward without trace.
+    /// Catch up a cold expert (loaded slot) by replaying tokens it missed.
     fn warmup_expert(&mut self, idx: usize) -> usize {
         let target = self.token_history.len();
-        let synced = self.experts[idx].synced_pos;
+        let synced = match &self.experts[idx] {
+            Some(e) => e.synced_pos,
+            None => return 0,
+        };
         if synced >= target {
             return 0;
         }
         let mut replayed = 0;
         for pos in synced..target {
             let tok = self.token_history[pos] as usize;
-            // Take split borrows: forward needs &model + &mut kv + &mut scratch
-            let e = &mut self.experts[idx];
-            let _ = forward_token_with_trace(
-                &e.model, tok, pos,
-                &mut e.kv, &mut e.scratch, false,
-            );
-            replayed += 1;
+            if let Some(e) = self.experts[idx].as_mut() {
+                let _ = forward_token_with_trace(
+                    &e.model, tok, pos,
+                    &mut e.kv, &mut e.scratch, false,
+                );
+                replayed += 1;
+            }
         }
-        self.experts[idx].synced_pos = target;
+        if let Some(e) = self.experts[idx].as_mut() {
+            e.synced_pos = target;
+        }
         replayed
+    }
+
+    /// Peek the classifier's decision for `token` WITHOUT committing
+    /// to history or running an expert forward. Updates a copy of the
+    /// EMA, runs the classifier, applies sticky-routing rules, returns
+    /// (intended_expert_idx, classifier_probs, margin).
+    ///
+    /// Caller pattern: peek → if not is_loaded(intended), fetch it,
+    /// then call step() which performs the real EMA update + forward.
+    /// This avoids the engine getting "stuck" on a fallback expert
+    /// before the real one is loaded.
+    pub fn peek_step(&self, token: u32) -> (usize, Vec<f32>, f32) {
+        // Compute what update_ema would do, but on a local copy.
+        let meaning: Vec<f32> = {
+            let dim = self.meaning_dim;
+            let off = token as usize * dim;
+            self.meaning_embed[off .. off + dim].to_vec()
+        };
+        // Simulate a hypothetical update_ema: blend flat-mean and
+        // self-masked attention pool. Don't mutate state.
+        let flat_blend = self.classifier.flat_blend;
+        let dim = self.meaning_dim;
+        let win = &self.classifier.window;
+        let ws = self.classifier.window_size;
+        let head = self.classifier.head;
+        let filled = self.classifier.filled;
+        let evicted_slot = if filled == ws { head } else { ws };
+
+        // Build the post-push K/V list (existing slots minus evicted)
+        let mut kv: Vec<&[f32]> = Vec::with_capacity(filled);
+        for slot in 0..filled {
+            if slot == evicted_slot { continue; }
+            let off = slot * dim;
+            kv.push(&win[off .. off + dim]);
+        }
+
+        // First-token corner case
+        let mut ema_clone = vec![0.0_f32; dim];
+        if kv.is_empty() {
+            for d in 0..dim { ema_clone[d] = meaning[d]; }
+        } else {
+            // Flat mean over (existing-minus-evicted) ∪ {new}
+            let mut flat = vec![0.0_f32; dim];
+            for v in &kv {
+                for d in 0..dim { flat[d] += v[d]; }
+            }
+            for d in 0..dim { flat[d] += meaning[d]; }
+            let inv_n = 1.0 / ((kv.len() + 1) as f32);
+            for d in 0..dim { flat[d] *= inv_n; }
+
+            // Attention over kv (which already excludes self)
+            let scale = 1.0 / (dim as f32).sqrt();
+            let mut scores = vec![0.0_f32; kv.len()];
+            let mut max_s = f32::NEG_INFINITY;
+            for (i, k) in kv.iter().enumerate() {
+                let mut s = 0.0_f32;
+                for d in 0..dim { s += meaning[d] * k[d]; }
+                s *= scale;
+                scores[i] = s;
+                if s > max_s { max_s = s; }
+            }
+            let mut sum = 0.0_f32;
+            for s in scores.iter_mut() { *s = (*s - max_s).exp(); sum += *s; }
+            let inv_sum = if sum > 1e-20 { 1.0 / sum } else { 0.0 };
+            for s in scores.iter_mut() { *s *= inv_sum; }
+            let mut attn = vec![0.0_f32; dim];
+            for (i, v) in kv.iter().enumerate() {
+                let w = scores[i];
+                for d in 0..dim { attn[d] += w * v[d]; }
+            }
+
+            // Blend
+            for d in 0..dim {
+                ema_clone[d] = flat_blend * flat[d] + (1.0 - flat_blend) * attn[d];
+            }
+        }
+        // classifier.predict() reads self.ema; we replicate its math
+        // against ema_clone instead.
+        let mut x = vec![0.0_f32; self.meaning_dim];
+        for i in 0..self.meaning_dim {
+            x[i] = (ema_clone[i] - self.classifier.feat_mu[i]) / self.classifier.feat_sd[i];
+        }
+        let mut h = vec![0.0_f32; self.classifier.hidden];
+        for i in 0..self.classifier.hidden {
+            let mut acc = self.classifier.b1[i];
+            let row = &self.classifier.w1[i * self.meaning_dim .. (i + 1) * self.meaning_dim];
+            for j in 0..self.meaning_dim { acc += row[j] * x[j]; }
+            if acc < 0.0 { acc = 0.0; }
+            h[i] = acc;
+        }
+        let mut logits = vec![0.0_f32; self.classifier.k];
+        for i in 0..self.classifier.k {
+            let mut acc = self.classifier.b2[i];
+            let row = &self.classifier.w2[i * self.classifier.hidden .. (i + 1) * self.classifier.hidden];
+            for j in 0..self.classifier.hidden { acc += row[j] * h[j]; }
+            logits[i] = acc;
+        }
+        let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0_f32;
+        for v in logits.iter_mut() { *v = (*v - max).exp(); sum += *v; }
+        for v in logits.iter_mut() { *v /= sum; }
+        let mut top1 = 0;
+        for i in 1..self.classifier.k {
+            if logits[i] > logits[top1] { top1 = i; }
+        }
+        let mut top2v = 0.0_f32;
+        for i in 0..self.classifier.k {
+            if i == top1 { continue; }
+            if logits[i] > top2v { top2v = logits[i]; }
+        }
+        let margin = logits[top1] - top2v;
+        // Apply sticky-routing rules + force-mode override
+        let intended = match self.mode {
+            RouteMode::Classifier => {
+                match self.last_chosen {
+                    Some(prev) if prev != top1 && margin < self.switch_threshold => prev,
+                    _ => top1,
+                }
+            }
+            RouteMode::Forced(idx) => idx,
+        };
+        (intended, logits, margin)
     }
 
     /// One step. `token` is the current input token; the engine will:
@@ -290,68 +610,76 @@ impl StitchedEngine {
         let meaning_owned: Vec<f32> = self.get_meaning(token).to_vec();
         self.classifier.update_ema(&meaning_owned);
 
-        // 3. Classify (or use forced mode), with sticky-hysteresis
-        // when in classifier mode: if we already have a last_chosen
-        // expert and the new classifier top-1 differs from it, only
-        // switch if (top1 - top2) margin >= switch_threshold. This
-        // prevents flutter between near-tied classes (e.g. pg19 vs
-        // wiki on short prose prompts).
+        // 3. Classify with sticky hysteresis (same as before)
         let (probs, classified_idx, margin) = self.classifier.predict();
-        let chosen = match self.mode {
+        let intended = match self.mode {
             RouteMode::Classifier => {
                 match self.last_chosen {
                     Some(prev) if prev != classified_idx
-                        && margin < self.switch_threshold => {
-                        // Don't switch — stick with previous expert.
-                        prev
-                    }
+                        && margin < self.switch_threshold => prev,
                     _ => classified_idx,
                 }
             }
             RouteMode::Forced(idx) => idx,
         };
+
+        // 3b. Lazy-load fallback: if intended slot isn't loaded, fall
+        // back to first loaded slot. JS will see `pending_expert` and
+        // can fetch it then re-step.
+        let pending = if !self.is_loaded(intended) { Some(intended) } else { None };
+        let chosen = if pending.is_some() {
+            self.first_loaded()
+                .expect("no experts loaded; engine cannot serve any token")
+        } else {
+            intended
+        };
+
         if matches!(self.mode, RouteMode::Classifier) {
             self.last_chosen = Some(chosen);
         }
 
         // 4. Catch up the chosen expert if cold
-        // (Replay is up to but NOT including pos — at pos we want to do
-        // the new forward.)
         let target_synced = pos;
-        let cur_synced = self.experts[chosen].synced_pos;
+        let cur_synced = self.experts[chosen].as_ref().map(|e| e.synced_pos).unwrap_or(0);
         let warmup_tokens = if cur_synced < target_synced {
-            // Need to replay tokens [cur_synced .. target_synced]
             let mut n = 0;
             for replay_pos in cur_synced..target_synced {
                 let rtok = self.token_history[replay_pos] as usize;
-                let e = &mut self.experts[chosen];
-                let _ = forward_token_with_trace(
-                    &e.model, rtok, replay_pos,
-                    &mut e.kv, &mut e.scratch, false,
-                );
-                n += 1;
+                if let Some(e) = self.experts[chosen].as_mut() {
+                    let _ = forward_token_with_trace(
+                        &e.model, rtok, replay_pos,
+                        &mut e.kv, &mut e.scratch, false,
+                    );
+                    n += 1;
+                }
             }
-            self.experts[chosen].synced_pos = target_synced;
+            if let Some(e) = self.experts[chosen].as_mut() {
+                e.synced_pos = target_synced;
+            }
             n
         } else {
             0
         };
 
         // 5. Forward the new token through the chosen expert
-        let e = &mut self.experts[chosen];
-        let trace = forward_token_with_trace(
-            &e.model, token as usize, pos,
-            &mut e.kv, &mut e.scratch, true,
-        ).expect("trace requested");
-        e.synced_pos = pos + 1;
-
-        // 6. Mask logits at the masked_tids for this expert
-        let mut logits = trace.logits;
-        for &tid in &self.experts[chosen].masked_tids {
-            if (tid as usize) < logits.len() {
-                logits[tid as usize] = f32::NEG_INFINITY;
+        let logits = if let Some(e) = self.experts[chosen].as_mut() {
+            let trace = forward_token_with_trace(
+                &e.model, token as usize, pos,
+                &mut e.kv, &mut e.scratch, true,
+            ).expect("trace requested");
+            e.synced_pos = pos + 1;
+            // 6. Mask logits at the masked_tids for this expert
+            let mut logits = trace.logits;
+            for &tid in &e.masked_tids {
+                if (tid as usize) < logits.len() {
+                    logits[tid as usize] = f32::NEG_INFINITY;
+                }
             }
-        }
+            logits
+        } else {
+            // Should never happen — first_loaded() already verified above.
+            vec![0.0f32; self.vocab_size]
+        };
 
         StitchStep {
             chosen_expert: chosen,
@@ -360,6 +688,7 @@ impl StitchedEngine {
             logits,
             warmup_happened: warmup_tokens > 0,
             warmup_tokens,
+            pending_expert: pending,
         }
     }
 

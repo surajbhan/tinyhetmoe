@@ -43,67 +43,91 @@ let bpeCache = new Map();
 
 // ─── Boot ────────────────────────────────────────────────────────────
 
+// Lazy fetch helper — gzip first, then raw fallback
+async function fetchBin(url) {
+  let resp = await fetch(`${url}.gz`);
+  if (resp.ok) {
+    const stream = resp.body.pipeThrough(new DecompressionStream("gzip"));
+    const ab = await new Response(stream).arrayBuffer();
+    return new Uint8Array(ab);
+  }
+  resp = await fetch(url);
+  if (!resp.ok) throw new Error(`fetch ${url} -> ${resp.status}`);
+  return new Uint8Array(await resp.arrayBuffer());
+}
+
+// Track in-flight + completed loads, keyed by expert idx.
+const expertFetches = new Map();  // idx -> Promise<void>
+
+
+async function ensureExpertLoaded(idx) {
+  if (engine.is_loaded(idx)) return;
+  if (expertFetches.has(idx)) return expertFetches.get(idx);
+
+  const e = stitch.experts[idx];
+  const node = document.getElementById(`ng-node-${idx}`);
+  node?.classList.add("loading");
+  const p = (async () => {
+    const t0 = performance.now();
+    const bytes = await fetchBin(`${BUNDLE_DIR}/${e.url}`);
+    engine.add_expert_lazy(idx, bytes);
+    const dt = performance.now() - t0;
+    node?.classList.remove("loading");
+    syncNodeLoadedState();
+    setStatus(`Loaded expert ${e.name} (${(bytes.length/1e6).toFixed(0)} MB in ${(dt/1000).toFixed(1)}s) ` +
+              `· ${engine.loaded_count}/${N_EXPERTS} experts cached`);
+  })();
+  expertFetches.set(idx, p);
+  return p;
+}
+
 async function boot() {
   setStatus("Loading wasm runtime…");
   await init({ module_or_path: `./${BUNDLE_DIR}/tiny_hetmoe_wasm_bg.wasm` });
 
-  setStatus("Fetching stitch bundle metadata…");
-  stitch = await fetch(`${BUNDLE_DIR}/stitch.json`).then((r) => r.json());
+  setStatus("Fetching stitch bundle metadata + tokenizer + shared meaning…");
+  // Light-weight fetches first: manifest + tokenizer + shared meaning
+  const t0 = performance.now();
+  const [stitchJson, encJson, decJson, meaningBytes] = await Promise.all([
+    fetch(`${BUNDLE_DIR}/stitch.json`).then((r) => r.json()),
+    fetch(`${BUNDLE_DIR}/encode.json`).then((r) => r.json()),
+    fetch(`${BUNDLE_DIR}/decode.json`).then((r) => r.json()),
+    fetchBin(`${BUNDLE_DIR}/meaning_shared.bin`),
+  ]);
+  stitch = stitchJson;
+  encodeData = encJson;
+  decodeTable = decJson;
   if (stitch.format_version !== "STITCHV7_001") {
     throw new Error(`unexpected stitch format ${stitch.format_version}`);
   }
-
-  // Fetch shared meaning + all 6 experts in parallel. We still flatten
-  // into one buffer for the wasm constructor.
-  setStatus("Fetching shared meaning + 6 expert .bin files in parallel…");
-  const t0 = performance.now();
-  const meaningP = fetch(`${BUNDLE_DIR}/${stitch.shared_meaning.url}`)
-    .then((r) => r.arrayBuffer())
-    .then((b) => new Uint8Array(b));
-  const expertPs = stitch.experts.map((e) =>
-    fetch(`${BUNDLE_DIR}/${e.url}`)
-      .then((r) => r.arrayBuffer())
-      .then((b) => new Uint8Array(b))
-  );
-  // Tokenizer in parallel too.
-  const encodeP = fetch(`${BUNDLE_DIR}/encode.json`).then((r) => r.json());
-  const decodeP = fetch(`${BUNDLE_DIR}/decode.json`).then((r) => r.json());
-
-  const [meaning, ...experts] = await Promise.all([meaningP, ...expertPs]);
-  encodeData = await encodeP;
-  decodeTable = await decodeP;
   buildEncoderTables();
 
-  const tFetch = performance.now() - t0;
-  const totalMB = (meaning.length + experts.reduce((s, b) => s + b.length, 0)) / 1e6;
-  setStatus(`Fetched ${totalMB.toFixed(1)} MB in ${(tFetch / 1000).toFixed(1)}s — assembling engine…`);
-
-  // Build flat buffer + offsets for the wasm constructor.
-  // Layout: [meaning][expert0][expert1]...[expertN-1]
-  // bin_offsets length = N+2: [0, end_of_meaning, end_of_expert0, ..., end_of_expertN-1]
-  const total = meaning.length + experts.reduce((s, b) => s + b.length, 0);
-  const flat = new Uint8Array(total);
-  const offsets = new Uint32Array(N_EXPERTS + 2);
-  let cursor = 0;
-  flat.set(meaning, cursor);
-  offsets[0] = 0;
-  cursor += meaning.length;
-  offsets[1] = cursor;
-  experts.forEach((b, i) => {
-    flat.set(b, cursor);
-    cursor += b.length;
-    offsets[2 + i] = cursor;
-  });
-
+  // Build the engine with classifier + meaning, but ZERO experts loaded.
+  setStatus(`Assembling engine (lazy: 0/${N_EXPERTS} experts loaded)…`);
   const tEng0 = performance.now();
-  engine = WasmStitchedEngine.new_v7(flat, offsets, JSON.stringify(stitch));
+  engine = WasmStitchedEngine.new_v7_lazy(meaningBytes, JSON.stringify(stitch));
   const tEng = performance.now() - tEng0;
 
+  // Stickier routing: classifier needs a 50% margin to switch experts
+  // mid-generation. Stops the code_py↔code_js / general↔medical flutter.
+  engine.set_switch_threshold(0.5);
+
+  // Build the distributed-node graph (SVG nodes + edges)
+  buildNodeGraph();
+
+  // Fetch the FIRST expert (general) before enabling the run button.
+  // This is enough to start generating; other experts fetch on demand.
+  setStatus("Fetching first expert (general) for warm start…");
+  await ensureExpertLoaded(0);
+
+  const tFetch = performance.now() - t0;
+  const firstLoadMB = (meaningBytes.length / 1e6) +
+    (stitch.experts[0].size_bytes / 1e6);
   $("run-btn").disabled = false;
   setStatus(
-    `Ready. ${engine.num_experts} experts (${engine.expert_names}), ` +
-    `vocab=${engine.vocab_size}. Engine built in ${tEng.toFixed(0)} ms. ` +
-    `Bundle ${totalMB.toFixed(0)} MB; classifier acc=${(stitch.classifier.best_val_acc*100).toFixed(1)}% on training val.`
+    `Ready. First-load ~${firstLoadMB.toFixed(0)} MB in ${(tFetch/1000).toFixed(1)}s. ` +
+    `Other 5 experts (~57 MB each) fetch on demand. ` +
+    `Vocab=${engine.vocab_size}; classifier acc=${(stitch.classifier.best_val_acc*100).toFixed(1)}%.`
   );
 }
 
@@ -266,6 +290,247 @@ function sampleTopK(logits, temperature, topK, rng) {
   return scaled.length - 1;
 }
 
+// ─── Distributed-node graph viz ──────────────────────────────────────
+//
+// Six expert nodes arranged on a hexagon around a central "router".
+// Per-token: router pulses → arrow flashes from router to chosen expert
+// → expert node lights up while the token is generated. The flash
+// duration scales with the latency-sim selector so WAN feels like an
+// actual network round-trip.
+
+const NODE_POSITIONS = (() => {
+  // Hexagonal layout. Center at (360, 160), radius 110, six nodes
+  // starting at angle -90° (top) going clockwise.
+  const cx = 360, cy = 160, r = 110;
+  const positions = [];
+  for (let i = 0; i < N_EXPERTS; i++) {
+    const angle = -Math.PI / 2 + (i * 2 * Math.PI) / N_EXPERTS;
+    positions.push({
+      x: cx + r * Math.cos(angle),
+      y: cy + r * Math.sin(angle),
+    });
+  }
+  return positions;
+})();
+
+const NODE_COLORS = ["#4a8fbb", "#c59c4f", "#6f9c4d", "#8b5fb4", "#c2603e", "#777777"];
+
+let ngTokenCounts = new Array(N_EXPERTS).fill(0);
+
+function syncNodeLoadedState() {
+  // Reflect engine.is_loaded(idx) -> CSS .loaded class on each node.
+  if (!engine) return;
+  for (let i = 0; i < N_EXPERTS; i++) {
+    const node = document.getElementById(`ng-node-${i}`);
+    if (!node) continue;
+    if (engine.is_loaded(i)) node.classList.add("loaded");
+    else node.classList.remove("loaded");
+  }
+}
+
+function buildNodeGraph() {
+  const ROUTER_X = 360, ROUTER_Y = 160;
+  const NODE_R = 28;
+
+  const edgesG = document.getElementById("ng-edges");
+  const dotsG = document.getElementById("ng-token-dots");
+  const nodesG = document.getElementById("ng-nodes");
+  if (!edgesG || !nodesG) return;
+
+  edgesG.innerHTML = "";
+  dotsG.innerHTML = "";
+  nodesG.innerHTML = "";
+
+  for (let i = 0; i < N_EXPERTS; i++) {
+    const { x, y } = NODE_POSITIONS[i];
+
+    // Edge router → node
+    const edge = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    edge.setAttribute("x1", ROUTER_X);
+    edge.setAttribute("y1", ROUTER_Y);
+    edge.setAttribute("x2", x);
+    edge.setAttribute("y2", y);
+    edge.setAttribute("class", "ng-edge");
+    edge.setAttribute("data-idx", String(i));
+    edge.setAttribute("id", `ng-edge-${i}`);
+    edgesG.appendChild(edge);
+
+    // Travelling dot (hidden until flashed)
+    const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    dot.setAttribute("class", "ng-token-dot");
+    dot.setAttribute("id", `ng-dot-${i}`);
+    dot.setAttribute("cx", ROUTER_X);
+    dot.setAttribute("cy", ROUTER_Y);
+    dotsG.appendChild(dot);
+
+    // Node group
+    const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    g.setAttribute("class", "ng-node");
+    g.setAttribute("data-idx", String(i));
+    g.setAttribute("id", `ng-node-${i}`);
+
+    // Pulse halo (under bg)
+    const pulse = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    pulse.setAttribute("class", "pulse");
+    pulse.setAttribute("cx", x);
+    pulse.setAttribute("cy", y);
+    pulse.setAttribute("r", "26");
+    g.appendChild(pulse);
+
+    // Background circle
+    const bg = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    bg.setAttribute("class", "bg");
+    bg.setAttribute("cx", x);
+    bg.setAttribute("cy", y);
+    bg.setAttribute("r", String(NODE_R));
+    g.appendChild(bg);
+
+    // Domain label
+    const lbl = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    lbl.setAttribute("class", "label");
+    lbl.setAttribute("x", x);
+    lbl.setAttribute("y", y - 6);
+    lbl.textContent = EXPERT_NAMES[i];
+    g.appendChild(lbl);
+
+    // Sub-tag: "node-N" (suggests separate machines)
+    const sub = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    sub.setAttribute("class", "subtag");
+    sub.setAttribute("x", x);
+    sub.setAttribute("y", y + 6);
+    sub.textContent = `node-${i + 1}`;
+    g.appendChild(sub);
+
+    // Token count
+    const cnt = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    cnt.setAttribute("class", "count");
+    cnt.setAttribute("x", x);
+    cnt.setAttribute("y", y + 17);
+    cnt.setAttribute("id", `ng-count-${i}`);
+    cnt.textContent = "0 tok";
+    g.appendChild(cnt);
+
+    nodesG.appendChild(g);
+  }
+  // Build the router's classifier-prob bars (6 vertical mini-bars inside
+  // the central router circle). Each bar grows in height with that
+  // expert's probability for the current step.
+  const barsG = document.getElementById("ng-router-bars");
+  if (barsG) {
+    barsG.innerHTML = "";
+    const BAR_W = 4;
+    const BAR_GAP = 2;
+    const TOTAL_W = N_EXPERTS * BAR_W + (N_EXPERTS - 1) * BAR_GAP;
+    const X0 = -TOTAL_W / 2;
+    const MAX_H = 22;  // max bar height (px)
+    for (let i = 0; i < N_EXPERTS; i++) {
+      const r = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      r.setAttribute("class", "rb");
+      r.setAttribute("data-idx", String(i));
+      r.setAttribute("x", String(X0 + i * (BAR_W + BAR_GAP)));
+      r.setAttribute("y", "0");
+      r.setAttribute("width", String(BAR_W));
+      r.setAttribute("height", "1");
+      r.setAttribute("fill", NODE_COLORS[i]);
+      r.setAttribute("opacity", "0.85");
+      r.setAttribute("rx", "1");
+      barsG.appendChild(r);
+    }
+    // Tag for max height
+    barsG.setAttribute("data-max-h", String(MAX_H));
+  }
+  syncNodeLoadedState();
+}
+
+function updateRouterBars(probs) {
+  const barsG = document.getElementById("ng-router-bars");
+  if (!barsG) return;
+  const MAX_H = parseInt(barsG.getAttribute("data-max-h") || "22", 10);
+  for (let i = 0; i < N_EXPERTS; i++) {
+    const r = barsG.querySelector(`rect.rb[data-idx="${i}"]`);
+    if (!r) continue;
+    const p = Math.max(0, Math.min(1, probs[i] || 0));
+    const h = Math.max(1, p * MAX_H);
+    r.setAttribute("height", String(h));
+    r.setAttribute("y", String(-h));  // grow upward from baseline
+  }
+}
+
+function resetNodeGraph() {
+  ngTokenCounts = new Array(N_EXPERTS).fill(0);
+  for (let i = 0; i < N_EXPERTS; i++) {
+    const node = document.getElementById(`ng-node-${i}`);
+    if (node) node.classList.remove("active", "pulsing");
+    const bg = node?.querySelector("circle.bg");
+    if (bg) bg.classList.remove("active");
+    const edge = document.getElementById(`ng-edge-${i}`);
+    if (edge) edge.classList.remove("active");
+    const cnt = document.getElementById(`ng-count-${i}`);
+    if (cnt) cnt.textContent = "0 tok";
+  }
+  // Reset router bars to baseline (1px height each)
+  updateRouterBars(new Array(N_EXPERTS).fill(0));
+}
+
+// Trigger the routing animation for one token.
+//   expertIdx: which node to light up
+//   flashMs:   how long the arrow + node pulse last (scaled by latency)
+//   probs:     classifier probabilities for the central router bars
+function flashRouting(expertIdx, flashMs = 200, probs = null) {
+  // Update the router's live classifier-prob bars
+  if (probs) updateRouterBars(probs);
+
+  // Increment count for this expert
+  ngTokenCounts[expertIdx]++;
+  const cnt = document.getElementById(`ng-count-${expertIdx}`);
+  if (cnt) cnt.textContent = `${ngTokenCounts[expertIdx]} tok`;
+
+  // Clear all "active" state, then set this one
+  for (let i = 0; i < N_EXPERTS; i++) {
+    const node = document.getElementById(`ng-node-${i}`);
+    const bg = node?.querySelector("circle.bg");
+    const edge = document.getElementById(`ng-edge-${i}`);
+    if (i === expertIdx) {
+      bg?.classList.add("active");
+      edge?.classList.add("active");
+      node?.classList.add("active");
+    } else {
+      bg?.classList.remove("active");
+      edge?.classList.remove("active");
+      node?.classList.remove("active");
+    }
+  }
+
+  // Re-trigger the pulse animation
+  const node = document.getElementById(`ng-node-${expertIdx}`);
+  if (node) {
+    node.classList.remove("pulsing");
+    // Force reflow so the animation restarts
+    void node.offsetWidth;
+    node.classList.add("pulsing");
+  }
+
+  // Travelling dot: animate position from router → node manually so we
+  // can scale duration with latency. CSS keyframes only fade opacity.
+  const dot = document.getElementById(`ng-dot-${expertIdx}`);
+  if (dot) {
+    const { x, y } = NODE_POSITIONS[expertIdx];
+    dot.setAttribute("cx", "360");
+    dot.setAttribute("cy", "160");
+    dot.classList.remove("flying");
+    void dot.getBoundingClientRect();  // reflow
+    dot.classList.add("flying");
+    // Animate via Web Animations API (so we can pick a duration)
+    dot.animate(
+      [
+        { cx: "360", cy: "160", opacity: 1 },
+        { cx: String(x), cy: String(y), opacity: 1 },
+      ],
+      { duration: Math.max(80, flashMs * 0.7), fill: "forwards" }
+    );
+  }
+}
+
 // ─── Token rendering ─────────────────────────────────────────────────
 
 function tokenSpan(tid, expertIdx, isPrompt) {
@@ -335,6 +600,7 @@ function getLatency() {
   return parseInt(document.querySelector('input[name="latency"]:checked').value, 10);
 }
 
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function generate() {
@@ -360,6 +626,7 @@ async function generate() {
   $("trace").innerHTML = "";
   $("stats").innerHTML = "";
   $("run-btn").disabled = true;
+  resetNodeGraph();
   setStatus(`Encoded prompt → ${promptTids.length} tokens. Generating…`);
 
   engine.reset();
@@ -369,22 +636,49 @@ async function generate() {
   const routes = [];
   let lastNext = 0;
 
+  // Latency sim drives both pacing and node-flash duration. Off=fast,
+  // LAN ~5ms = brief flash, WAN ~50ms = each routing visibly travels.
+  const flashMs = Math.max(120, latencyMs * 4);
+
+  // Step helper that handles lazy-load of pending experts.
+  // Peek the classifier BEFORE committing the token: if the classifier
+  // wants an unloaded expert, AWAIT the fetch first, THEN do the real
+  // step. This makes "first generation on a new domain" pause briefly
+  // while that expert downloads — like inserting a cartridge before
+  // pressing play.
+  const stepWithLazyLoad = async (tid) => {
+    const intended = engine.peek_expert(tid);
+    if (!engine.is_loaded(intended)) {
+      const name = stitch.experts[intended].name;
+      setStatus(`Classifier picked ${name} — fetching expert (~57 MB) before generating…`);
+      await ensureExpertLoaded(intended);
+      setStatus(`${name} loaded. Resuming generation.`);
+    }
+    return engine.step(tid);
+  };
+
   // Phase 1: feed prompt
   for (const tid of promptTids) {
-    const step = engine.step(tid);
+    const step = await stepWithLazyLoad(tid);
     routes.push(step.chosen_expert);
     $("output").appendChild(tokenSpan(tid, step.chosen_expert, true));
     renderTraceRow(engine.position - 1, tid, step, true);
+    flashRouting(step.chosen_expert, flashMs, Array.from(step.classifier_probs));
     if (latencyMs > 0) await sleep(latencyMs);
     lastNext = argmax(step.logits);
   }
 
   // Phase 2: generate
+  // The classifier uses a sliding window of the last 64 meaning vectors,
+  // so prompt context stays load-bearing for many generation tokens
+  // without any explicit prompt-lock. Genuine drift still flips the
+  // route; surface noise doesn't.
   for (let i = 0; i < nGen; i++) {
-    const step = engine.step(lastNext);
+    const step = await stepWithLazyLoad(lastNext);
     routes.push(step.chosen_expert);
     $("output").appendChild(tokenSpan(lastNext, step.chosen_expert, false));
     renderTraceRow(engine.position - 1, lastNext, step, false);
+    flashRouting(step.chosen_expert, flashMs, Array.from(step.classifier_probs));
     renderStats(routes);
     await sleep(Math.max(latencyMs, 1));
     lastNext = sampleTopK(step.logits, temp, topK, rng);
@@ -405,6 +699,7 @@ $("reset-btn").addEventListener("click", () => {
   $("output").innerHTML = "";
   $("trace").innerHTML = "";
   $("stats").innerHTML = "";
+  resetNodeGraph();
   setStatus("Reset.");
 });
 
@@ -413,6 +708,17 @@ document.querySelectorAll('input[name="route-mode"]').forEach((el) => {
     if (engine) engine.force_expert(getRouteMode());
   });
 });
+
+// Routing blend slider — wires the classifier's flat-vs-attention ratio.
+const flatBlendEl = $("flat-blend");
+const flatBlendValEl = $("flat-blend-val");
+if (flatBlendEl) {
+  flatBlendEl.addEventListener("input", () => {
+    const v = parseInt(flatBlendEl.value, 10) / 100;
+    if (engine) engine.set_flat_blend(v);
+    if (flatBlendValEl) flatBlendValEl.textContent = `flat=${v.toFixed(2)}`;
+  });
+}
 
 document.querySelectorAll(".example-btn").forEach((btn) => {
   btn.addEventListener("click", () => {

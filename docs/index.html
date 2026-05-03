@@ -16,11 +16,15 @@
         Built around a 132-axis <b>named meaning embedding</b> &mdash; so every prediction can be
         explained, not just measured. Click tokens to inspect; click candidates to extend.
         See the <a href="blog.html" class="header-link">blog</a> for how it was built or the
-        <a href="journal.html" class="header-link">journal</a> for the day-by-day log.
+        <a href="journal.html" class="header-link">journal</a> for the day-by-day log.<br>
+        New: <a href="stitch_v7.html" class="header-link"><b>stitched v7 demo</b></a> &mdash; six 114M ternary experts,
+        per-token routing, full Qwen vocab, distributed-node visualization.
       </span>
     </div>
     <div class="topbar-right">
       <nav class="topbar-nav">
+        <a href="stitch_v7.html" class="nav-pill"><b>stitched v7 ↗</b></a>
+        <a href="stitch.html" class="nav-pill">stitched v6</a>
         <a href="blog.html" class="nav-pill">blog</a>
         <a href="journal.html" class="nav-pill">journal</a>
         <a href="https://github.com/surajbhan/tinyhetmoe" target="_blank" class="nav-pill">github ↗</a>
@@ -34,6 +38,21 @@
       </div>
     </div>
   </header>
+
+  <!-- v7 callout banner: prominent, sits between header and grid.
+       The home demo is the v6 single-model story; v7 is the
+       multi-expert / distributed-routing story and deserves its own
+       front-door entry. -->
+  <a href="stitch_v7.html" class="v7-callout" title="Open the stitched v7 demo">
+    <span class="v7-callout-tag">NEW</span>
+    <span class="v7-callout-text">
+      <b>Stitched v7 — six experts, per-token routing, distributed inference.</b>
+      Six 114M ternary models, distilled from Qwen 2.5 0.5B-class teachers,
+      each on its own &ldquo;node.&rdquo; Watch the router decide which one
+      handles each token, live in your browser.
+    </span>
+    <span class="v7-callout-arrow">→ open the demo</span>
+  </a>
 
   <main class="grid">
     <!-- LEFT COLUMN: story + auto controls -->

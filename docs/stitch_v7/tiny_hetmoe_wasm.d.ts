@@ -58,6 +58,7 @@ export class WasmStitchStep {
     readonly classifier_probs: Float32Array;
     readonly confidence: number;
     readonly logits: Float32Array;
+    readonly pending_expert: number;
     readonly warmup_happened: boolean;
     readonly warmup_tokens: number;
 }
@@ -69,10 +70,20 @@ export class WasmStitchedEngine {
     free(): void;
     [Symbol.dispose](): void;
     /**
+     * Lazy-load: insert an expert at the given classifier-index slot.
+     * `expert_idx` is the classifier output position (0..K). Bytes is
+     * the HTMOE004 .bin (without meaning_embed; engine supplies shared).
+     */
+    add_expert_lazy(expert_idx: number, expert_bytes: Uint8Array): void;
+    /**
      * Force routing to a specific expert idx for subsequent step() calls.
      * Pass -1 (or any negative value) to release back to classifier mode.
      */
     force_expert(idx: number): void;
+    /**
+     * Is expert at classifier idx loaded?
+     */
+    is_loaded(idx: number): boolean;
     /**
      * Construct from N expert .bin byte buffers + the stitch.json text.
      *
@@ -107,13 +118,48 @@ export class WasmStitchedEngine {
      *   - experts[i].masked_tids may be absent (default empty)
      */
     static new_v7(flat_bytes: Uint8Array, bin_offsets: Uint32Array, stitch_json: string): WasmStitchedEngine;
+    /**
+     * V7 LAZY constructor.
+     *
+     * Construct an engine with the shared meaning + classifier from
+     * stitch.json, but ZERO experts loaded. Caller fetches each expert
+     * .bin lazily and calls `add_expert_lazy(name, bytes)` to load it.
+     * Engine still produces `step()` results; if classifier picks an
+     * unloaded expert, `step.pending_expert` reports which idx, and the
+     * engine falls back to the first loaded expert for output.
+     */
+    static new_v7_lazy(meaning_bytes: Uint8Array, stitch_json: string): WasmStitchedEngine;
+    /**
+     * Peek what expert the classifier WOULD pick for `token` without
+     * committing the token to history or running a forward. Returns the
+     * intended (post-sticky) expert idx. Use to pre-fetch experts
+     * before calling step().
+     */
+    peek_expert(token: number): number;
     reset(): void;
+    /**
+     * Set the classifier-input blend ratio between flat-window mean and
+     * attention pool. 0.0 = pure attention (reactive but can over-respond
+     * to surface noise), 1.0 = pure flat mean (stable but slow to drift).
+     * Default 0.5. Range [0, 1].
+     */
+    set_flat_blend(t: number): void;
+    /**
+     * Set the sticky-routing threshold. Higher = harder to switch experts
+     * once locked in. Default 0.3. Range [0, 1].
+     */
+    set_switch_threshold(t: number): void;
     step(token: number): WasmStitchStep;
     /**
      * Return expert names as a single comma-joined string. JS splits on `,`.
      * Avoids the wasm-bindgen overhead of returning Vec<String>.
      */
     readonly expert_names: string;
+    readonly flat_blend: number;
+    /**
+     * Number of currently-loaded experts (rest are lazy slots).
+     */
+    readonly loaded_count: number;
     readonly num_experts: number;
     readonly position: number;
     readonly vocab_size: number;
@@ -142,19 +188,28 @@ export interface InitOutput {
     readonly wasmstep_logits: (a: number, b: number) => void;
     readonly wasmstep_meaning: (a: number, b: number) => void;
     readonly wasmstep_routing_flat: (a: number, b: number) => void;
+    readonly wasmstitchedengine_add_expert_lazy: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly wasmstitchedengine_expert_names: (a: number, b: number) => void;
+    readonly wasmstitchedengine_flat_blend: (a: number) => number;
     readonly wasmstitchedengine_force_expert: (a: number, b: number) => void;
+    readonly wasmstitchedengine_is_loaded: (a: number, b: number) => number;
+    readonly wasmstitchedengine_loaded_count: (a: number) => number;
     readonly wasmstitchedengine_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly wasmstitchedengine_new_v7: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+    readonly wasmstitchedengine_new_v7_lazy: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly wasmstitchedengine_num_experts: (a: number) => number;
+    readonly wasmstitchedengine_peek_expert: (a: number, b: number) => number;
     readonly wasmstitchedengine_position: (a: number) => number;
     readonly wasmstitchedengine_reset: (a: number) => void;
+    readonly wasmstitchedengine_set_flat_blend: (a: number, b: number) => void;
+    readonly wasmstitchedengine_set_switch_threshold: (a: number, b: number) => void;
     readonly wasmstitchedengine_step: (a: number, b: number) => number;
     readonly wasmstitchedengine_vocab_size: (a: number) => number;
     readonly wasmstitchstep_chosen_expert: (a: number) => number;
     readonly wasmstitchstep_classifier_probs: (a: number, b: number) => void;
     readonly wasmstitchstep_confidence: (a: number) => number;
     readonly wasmstitchstep_logits: (a: number, b: number) => void;
+    readonly wasmstitchstep_pending_expert: (a: number) => number;
     readonly wasmstitchstep_warmup_happened: (a: number) => number;
     readonly wasmstitchstep_warmup_tokens: (a: number) => number;
     readonly __wbindgen_export: (a: number, b: number) => number;

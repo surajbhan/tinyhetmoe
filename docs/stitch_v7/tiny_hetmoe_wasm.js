@@ -306,6 +306,13 @@ export class WasmStitchStep {
         }
     }
     /**
+     * @returns {number}
+     */
+    get pending_expert() {
+        const ret = wasm.wasmstitchstep_pending_expert(this.__wbg_ptr);
+        return ret;
+    }
+    /**
      * @returns {boolean}
      */
     get warmup_happened() {
@@ -343,6 +350,28 @@ export class WasmStitchedEngine {
         wasm.__wbg_wasmstitchedengine_free(ptr, 0);
     }
     /**
+     * Lazy-load: insert an expert at the given classifier-index slot.
+     * `expert_idx` is the classifier output position (0..K). Bytes is
+     * the HTMOE004 .bin (without meaning_embed; engine supplies shared).
+     * @param {number} expert_idx
+     * @param {Uint8Array} expert_bytes
+     */
+    add_expert_lazy(expert_idx, expert_bytes) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passArray8ToWasm0(expert_bytes, wasm.__wbindgen_export);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.wasmstitchedengine_add_expert_lazy(retptr, this.__wbg_ptr, expert_idx, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            if (r1) {
+                throw takeObject(r0);
+            }
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
      * Return expert names as a single comma-joined string. JS splits on `,`.
      * Avoids the wasm-bindgen overhead of returning Vec<String>.
      * @returns {string}
@@ -364,12 +393,36 @@ export class WasmStitchedEngine {
         }
     }
     /**
+     * @returns {number}
+     */
+    get flat_blend() {
+        const ret = wasm.wasmstitchedengine_flat_blend(this.__wbg_ptr);
+        return ret;
+    }
+    /**
      * Force routing to a specific expert idx for subsequent step() calls.
      * Pass -1 (or any negative value) to release back to classifier mode.
      * @param {number} idx
      */
     force_expert(idx) {
         wasm.wasmstitchedengine_force_expert(this.__wbg_ptr, idx);
+    }
+    /**
+     * Is expert at classifier idx loaded?
+     * @param {number} idx
+     * @returns {boolean}
+     */
+    is_loaded(idx) {
+        const ret = wasm.wasmstitchedengine_is_loaded(this.__wbg_ptr, idx);
+        return ret !== 0;
+    }
+    /**
+     * Number of currently-loaded experts (rest are lazy slots).
+     * @returns {number}
+     */
+    get loaded_count() {
+        const ret = wasm.wasmstitchedengine_loaded_count(this.__wbg_ptr);
+        return ret >>> 0;
     }
     /**
      * Construct from N expert .bin byte buffers + the stitch.json text.
@@ -455,10 +508,54 @@ export class WasmStitchedEngine {
         }
     }
     /**
+     * V7 LAZY constructor.
+     *
+     * Construct an engine with the shared meaning + classifier from
+     * stitch.json, but ZERO experts loaded. Caller fetches each expert
+     * .bin lazily and calls `add_expert_lazy(name, bytes)` to load it.
+     * Engine still produces `step()` results; if classifier picks an
+     * unloaded expert, `step.pending_expert` reports which idx, and the
+     * engine falls back to the first loaded expert for output.
+     * @param {Uint8Array} meaning_bytes
+     * @param {string} stitch_json
+     * @returns {WasmStitchedEngine}
+     */
+    static new_v7_lazy(meaning_bytes, stitch_json) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passArray8ToWasm0(meaning_bytes, wasm.__wbindgen_export);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(stitch_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len1 = WASM_VECTOR_LEN;
+            wasm.wasmstitchedengine_new_v7_lazy(retptr, ptr0, len0, ptr1, len1);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return WasmStitchedEngine.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
      * @returns {number}
      */
     get num_experts() {
         const ret = wasm.wasmstitchedengine_num_experts(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * Peek what expert the classifier WOULD pick for `token` without
+     * committing the token to history or running a forward. Returns the
+     * intended (post-sticky) expert idx. Use to pre-fetch experts
+     * before calling step().
+     * @param {number} token
+     * @returns {number}
+     */
+    peek_expert(token) {
+        const ret = wasm.wasmstitchedengine_peek_expert(this.__wbg_ptr, token);
         return ret >>> 0;
     }
     /**
@@ -470,6 +567,24 @@ export class WasmStitchedEngine {
     }
     reset() {
         wasm.wasmstitchedengine_reset(this.__wbg_ptr);
+    }
+    /**
+     * Set the classifier-input blend ratio between flat-window mean and
+     * attention pool. 0.0 = pure attention (reactive but can over-respond
+     * to surface noise), 1.0 = pure flat mean (stable but slow to drift).
+     * Default 0.5. Range [0, 1].
+     * @param {number} t
+     */
+    set_flat_blend(t) {
+        wasm.wasmstitchedengine_set_flat_blend(this.__wbg_ptr, t);
+    }
+    /**
+     * Set the sticky-routing threshold. Higher = harder to switch experts
+     * once locked in. Default 0.3. Range [0, 1].
+     * @param {number} t
+     */
+    set_switch_threshold(t) {
+        wasm.wasmstitchedengine_set_switch_threshold(this.__wbg_ptr, t);
     }
     /**
      * @param {number} token

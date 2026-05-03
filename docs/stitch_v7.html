@@ -6,6 +6,12 @@
   <title>TinyHetMoE v7 — Stitched (6 experts, full Qwen vocab)</title>
   <link rel="stylesheet" href="style.css" />
   <style>
+    /* Override the demo's viewport-lock — v7 is a long page that needs
+       to scroll naturally on every screen size. */
+    @media (min-width: 1101px) {
+      html, body { height: auto; overflow: auto; }
+    }
+
     /* v7 stitch styles. Mirrors stitch.html but with 6 experts. */
     .stitch-main { max-width: 1080px; margin: 24px auto; padding: 0 16px; }
     .stitch-status { font-family: monospace; font-size: 13px; color: var(--ink-mute); margin-bottom: 12px; }
@@ -96,17 +102,194 @@
       color: var(--ink-mute);
     }
     .info-banner strong { color: var(--ink); }
+
+    /* ── Distributed-node graph ─────────────────────────────────────────
+       Six expert "nodes" arranged on a hexagon around a central "router".
+       Per token: router pulses (classifier confidence), arrow flashes from
+       router to chosen expert, that expert pulses while generation runs.
+       The latency-sim selector wires into how long the arrow flash lasts —
+       at WAN 50ms it feels like a real round trip. */
+    .graph-card {
+      border: 1px solid var(--rule);
+      border-radius: 6px;
+      background: var(--surface-1);
+      padding: 12px 14px;
+      margin-bottom: 14px;
+    }
+    .graph-card-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      margin-bottom: 6px;
+      font-size: 12px;
+      color: var(--ink-mute);
+    }
+    .graph-card-head .title {
+      font-weight: 600;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+      color: var(--ink);
+      font-size: 11px;
+    }
+    .graph-card-head .legend-text {
+      font-style: italic;
+    }
+    #node-graph {
+      display: block;
+      width: 100%;
+      max-width: 720px;
+      height: 320px;
+      margin: 0 auto;
+    }
+    /* Node base styles. Default = subdued domain color; active = bright. */
+    .ng-node circle.bg {
+      fill: var(--surface-0);
+      stroke-width: 1.5;
+      transition: stroke-width 0.15s, fill 0.15s, opacity 0.15s;
+      opacity: 0.55;
+    }
+    .ng-node text.label {
+      font-family: monospace;
+      font-size: 11px;
+      text-anchor: middle;
+      dominant-baseline: central;
+      fill: var(--ink);
+      font-weight: 500;
+    }
+    .ng-node text.subtag {
+      font-family: monospace;
+      font-size: 9px;
+      text-anchor: middle;
+      dominant-baseline: central;
+      fill: var(--ink-mute);
+    }
+    /* Default subdued fill per domain — muted (low alpha border-only feel) */
+    .ng-node[data-idx="0"] circle.bg { fill: rgba(74,143,187,0.18);  stroke: #4a8fbb; }
+    .ng-node[data-idx="1"] circle.bg { fill: rgba(197,156,79,0.18);  stroke: #c59c4f; }
+    .ng-node[data-idx="2"] circle.bg { fill: rgba(111,156,77,0.18);  stroke: #6f9c4d; }
+    .ng-node[data-idx="3"] circle.bg { fill: rgba(139,95,180,0.18);  stroke: #8b5fb4; }
+    .ng-node[data-idx="4"] circle.bg { fill: rgba(194,96,62,0.18);   stroke: #c2603e; }
+    .ng-node[data-idx="5"] circle.bg { fill: rgba(119,119,119,0.18); stroke: #777777; }
+    /* Active state: solid fill, full opacity, thicker stroke */
+    .ng-node[data-idx="0"] circle.bg.active { fill: #4a8fbb; }
+    .ng-node[data-idx="1"] circle.bg.active { fill: #c59c4f; }
+    .ng-node[data-idx="2"] circle.bg.active { fill: #6f9c4d; }
+    .ng-node[data-idx="3"] circle.bg.active { fill: #8b5fb4; }
+    .ng-node[data-idx="4"] circle.bg.active { fill: #c2603e; }
+    .ng-node[data-idx="5"] circle.bg.active { fill: #777777; }
+    .ng-node circle.bg.active { stroke-width: 3; opacity: 1; }
+    .ng-node.active text.label { fill: #fff; font-weight: 600; }
+    .ng-node.active text.subtag { fill: rgba(255,255,255,0.8); }
+    /* "Loaded" state styling: experts not yet fetched are dashed */
+    .ng-node:not(.loaded) circle.bg {
+      stroke-dasharray: 4 3;
+      opacity: 0.32;
+    }
+    .ng-node:not(.loaded) text.label,
+    .ng-node:not(.loaded) text.subtag,
+    .ng-node:not(.loaded) text.count {
+      opacity: 0.55;
+    }
+    /* Loading spinner: rotating arc on the node */
+    .ng-node.loading circle.bg {
+      stroke-dasharray: 8 4;
+      animation: ng-spin 1.4s linear infinite;
+      opacity: 0.85;
+    }
+    @keyframes ng-spin {
+      0%   { stroke-dashoffset: 0; }
+      100% { stroke-dashoffset: -36; }
+    }
+    /* Pulse halo when expert is processing */
+    .ng-node circle.pulse {
+      fill: none;
+      stroke: var(--ink);
+      stroke-width: 2;
+      opacity: 0;
+      pointer-events: none;
+    }
+    .ng-node[data-idx="0"] circle.pulse { stroke: #4a8fbb; }
+    .ng-node[data-idx="1"] circle.pulse { stroke: #c59c4f; }
+    .ng-node[data-idx="2"] circle.pulse { stroke: #6f9c4d; }
+    .ng-node[data-idx="3"] circle.pulse { stroke: #8b5fb4; }
+    .ng-node[data-idx="4"] circle.pulse { stroke: #c2603e; }
+    .ng-node[data-idx="5"] circle.pulse { stroke: #777777; }
+    .ng-node.pulsing circle.pulse {
+      animation: ng-pulse 700ms ease-out;
+    }
+    @keyframes ng-pulse {
+      0%   { opacity: 0.6; r: 26; }
+      100% { opacity: 0;   r: 44; }
+    }
+    /* Router node */
+    #ng-router circle.bg {
+      fill: var(--surface-2);
+      stroke: var(--ink-mute);
+      stroke-width: 1.5;
+    }
+    #ng-router text.label {
+      font-family: monospace;
+      font-size: 11px;
+      text-anchor: middle;
+      dominant-baseline: central;
+      fill: var(--ink);
+      font-weight: 600;
+    }
+    #ng-router-bars rect {
+      transition: height 0.15s, y 0.15s;
+    }
+    /* Edges (router → nodes) */
+    .ng-edge {
+      stroke: var(--rule);
+      stroke-width: 1;
+      fill: none;
+      transition: stroke-width 0.1s, opacity 0.1s;
+    }
+    .ng-edge.active {
+      stroke-width: 2.5;
+      opacity: 1;
+    }
+    .ng-edge[data-idx="0"].active { stroke: #4a8fbb; }
+    .ng-edge[data-idx="1"].active { stroke: #c59c4f; }
+    .ng-edge[data-idx="2"].active { stroke: #6f9c4d; }
+    .ng-edge[data-idx="3"].active { stroke: #8b5fb4; }
+    .ng-edge[data-idx="4"].active { stroke: #c2603e; }
+    .ng-edge[data-idx="5"].active { stroke: #777777; }
+    /* Travelling token dot along the edge */
+    .ng-token-dot {
+      r: 4;
+      fill: var(--ink);
+      opacity: 0;
+      pointer-events: none;
+    }
+    .ng-token-dot.flying {
+      animation: ng-fly 280ms ease-out forwards;
+    }
+    @keyframes ng-fly {
+      0%   { opacity: 1; }
+      100% { opacity: 0; }
+    }
+    /* Token counter chip per node */
+    .ng-node text.count {
+      font-family: monospace;
+      font-size: 9px;
+      text-anchor: middle;
+      dominant-baseline: central;
+      fill: var(--ink-mute);
+    }
+    .ng-node.active text.count { fill: rgba(255,255,255,0.85); }
   </style>
 </head>
 <body class="prose-page">
   <header class="topbar">
     <div class="topbar-left">
-      <h1><a href="./">TinyHetMoE<span class="logo-dot">.</span></a> <span class="page-tag">/ stitched v7</span></h1>
+      <h1><a href="./">TinyHetMoE<span class="logo-dot">.</span></a> <span class="page-tag">/ stitched v7 — distributed inference</span></h1>
       <span class="subtitle">
-        Six 114M-param ternary experts (general / thinker / code_py / code_js /
-        medical / legal), each distilled from Qwen 2.5 0.5B-class teachers, with
-        per-token routing through a frozen meaning-axis classifier. Full Qwen
-        vocab (151,665 tokens). Bundle ~400 MB; first load ~110 MB.
+        <b>Scaling AI by adding experts, not parameters.</b>
+        Six independent 114M-param ternary experts, each trained on its own
+        domain, each runnable on its own machine. The router picks one
+        per token. Add a 7th node tomorrow, the system keeps working.
+        <a href="blog.html?post=5-the-dream-instantiated" class="header-link">Read the post →</a>
       </span>
     </div>
     <div class="topbar-right">
@@ -121,9 +304,36 @@
     <div id="status" class="stitch-status">Booting…</div>
 
     <div class="info-banner">
-      <strong>What this is:</strong> a single page running 6 ternary experts in WASM,
-      with token-level routing decided live by a classifier on the frozen
-      meaning embedding. Color under each token = which expert produced it.
+      <strong>The thesis: scale by sharding domains, not by growing one model.</strong>
+      Six independent 114M ternary experts (~57 MB each), distilled from Qwen 2.5
+      0.5B-class teachers on their own domain. Architecturally each expert can live
+      on a different machine — only the token id and the 132-dim meaning vector
+      cross the wire. <strong>Experts load on demand:</strong> the classifier picks
+      one per token, and we only fetch a model the first time we need it.
+      Use the latency selector to <em>feel</em> what a real distributed deploy would be like.
+    </div>
+
+    <div class="graph-card">
+      <div class="graph-card-head">
+        <span class="title">Distributed routing</span>
+        <span class="legend-text">router (center) dispatches each token to one expert (active node lights up)</span>
+      </div>
+      <svg id="node-graph" viewBox="0 0 720 320" preserveAspectRatio="xMidYMid meet">
+        <!-- Edges drawn first so nodes overlap them -->
+        <g id="ng-edges"></g>
+        <!-- Travelling token dots (one per edge, hidden until active) -->
+        <g id="ng-token-dots"></g>
+        <!-- Router (centered) — bigger circle with live classifier-prob bars -->
+        <g id="ng-router">
+          <circle class="bg" cx="360" cy="160" r="40"></circle>
+          <text class="label" x="360" y="138">router</text>
+          <!-- Six tiny vertical bars (one per expert), populated by JS each step -->
+          <g id="ng-router-bars" transform="translate(360, 160)"></g>
+          <text class="subtag" x="360" y="190" style="font-size:9px;fill:var(--ink-mute);font-family:monospace;">classifier probs</text>
+        </g>
+        <!-- Six expert nodes (positions filled by JS) -->
+        <g id="ng-nodes"></g>
+      </svg>
     </div>
 
     <div class="controls">
@@ -138,10 +348,19 @@
         <strong>Examples</strong>
         <button class="secondary example-btn" data-text="The capital of France is">Geo fact</button>
         <button class="secondary example-btn" data-text="Question: If a train leaves at 3pm going 60 mph, where is it at 5pm?&#10;&#10;Answer:">Math</button>
-        <button class="secondary example-btn" data-text="def fibonacci(n):&#10;    if n &lt; 2:&#10;        return n&#10;    return">Python</button>
-        <button class="secondary example-btn" data-text="function fibonacci(n) {&#10;  if (n &lt; 2) return n;&#10;  return">JavaScript</button>
+        <button class="secondary example-btn" data-text="# Problem&#10;Write a function that returns the sum of the first n integers.&#10;&#10;# Solution&#10;def sum_first(n):&#10;    total = 0&#10;    for i in range(1, n + 1):&#10;        total += i&#10;    return">Python</button>
+        <button class="secondary example-btn" data-text="// Problem&#10;Write a function that returns the sum of the first n integers.&#10;&#10;// Solution&#10;function sumFirst(n) {&#10;  let total = 0;&#10;  for (let i = 1; i &lt;= n; i++) {&#10;    total += i;&#10;  }&#10;  return">JavaScript</button>
         <button class="secondary example-btn" data-text="Question: What are the symptoms of pneumonia?&#10;&#10;Answer:">Medical</button>
         <button class="secondary example-btn" data-text="Question: What is the difference between civil and criminal law?&#10;&#10;Answer:">Legal</button>
+      </div>
+      <div class="row" style="grid-column: 1 / -1;">
+        <strong>Cross-domain</strong>
+        <span style="font-size:11px; color:var(--ink-mute); margin-right:6px;">
+          (the router averages over the last 64 tokens — drifts when generation genuinely crosses domains)
+        </span>
+        <button class="secondary example-btn" data-text="Question: Solve 12 + 7 = ?&#10;&#10;Answer: The result is" title="Math start, then prose continuation. Watch thinker → general flip.">Math then prose</button>
+        <button class="secondary example-btn" data-text="The patient was prescribed 500 mg of amoxicillin. Question: How many milligrams in total over 7 days, taken twice daily?&#10;&#10;Answer:" title="Medical context with arithmetic. Watch medical → thinker flip.">Medical then math</button>
+        <button class="secondary example-btn" data-text="// Problem&#10;Write a function that computes Fibonacci recursively.&#10;&#10;Explanation: This is a classic algorithm problem in computer science. The function" title="Code prompt, then natural-language explanation. Watch code_js → general flip.">Code then prose</button>
       </div>
 
       <div class="row" style="grid-column: 1 / -1;">
@@ -169,6 +388,19 @@
         <label><input type="radio" name="latency" value="5"> LAN (~5ms)</label>
         <label><input type="radio" name="latency" value="50"> WAN (~50ms)</label>
       </div>
+
+      <div class="row" style="grid-column: 1 / -1;"
+           title="Classifier feature = flat·flat_window_mean + (1-flat)·attention_pool. Higher flat → more anchored to whole-window context (sticky). Lower flat → more reactive to current token (drifts on cross-domain content).">
+        <strong>Routing blend</strong>
+        <label style="display:flex; align-items:center; gap:6px; flex:1;">
+          <span style="font-size:11px; color:var(--ink-mute);">attention</span>
+          <input type="range" id="flat-blend" min="0" max="100" step="5" value="50"
+                 style="flex:1; max-width:300px;">
+          <span style="font-size:11px; color:var(--ink-mute);">flat-window</span>
+          <span id="flat-blend-val" style="font-family:monospace; font-size:12px; min-width:60px;">flat=0.50</span>
+        </label>
+      </div>
+
     </div>
 
     <div id="output" class="output">

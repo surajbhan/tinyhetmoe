@@ -187,7 +187,8 @@ fn main() {
     for &tok in &prompt_tids {
         let step = engine.step(tok);
         let pos = engine.token_history.len() - 1;
-        let expert_name = engine.experts[step.chosen_expert].name.clone();
+        let expert_name = engine.experts[step.chosen_expert]
+            .as_ref().map(|e| e.name.clone()).unwrap_or_default();
         let next = argmax(&step.logits);
         last_logits_argmax = Some(next);
         let probs_str: Vec<String> = step.classifier_probs.iter()
@@ -224,7 +225,8 @@ fn main() {
         for _ in 0..gen_count {
             let step = engine.step(next_tok);
             let pos = engine.token_history.len() - 1;
-            let expert_name = engine.experts[step.chosen_expert].name.clone();
+            let expert_name = engine.experts[step.chosen_expert]
+            .as_ref().map(|e| e.name.clone()).unwrap_or_default();
             let next = if temperature <= 0.0 {
                 argmax(&step.logits)
             } else {

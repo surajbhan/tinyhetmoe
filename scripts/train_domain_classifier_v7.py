@@ -43,37 +43,50 @@ DOMAINS = ["general", "thinker", "code_py", "code_js", "medical", "legal"]
 
 def stream_features(domain: str, axes: np.ndarray, n_windows: int,
                     tok) -> np.ndarray:
-    """Pull text from the domain stream, tokenize it, slice into 512-token
-    windows, lookup meaning vectors, EMA over the window. Returns (n_windows, 132)."""
-    print(f"[clf] streaming {domain} for {n_windows} windows of {WINDOW} tokens...")
+    """Pull text from the domain stream, tokenize it, sample windows of
+    VARYING length (mimicking what the classifier sees at test time on
+    short prompts), lookup meaning vectors, EMA over the window.
+    Returns (n_windows, 132).
+
+    The window-length distribution is chosen so the classifier sees both
+    short (cold-EMA) and long (saturated-EMA) views of each domain. The
+    v1 trainer only used WINDOW=512 which made the classifier bad on
+    test prompts of <30 tokens.
+    """
+    # Window length distribution: heavy on short windows so cold-EMA
+    # cases (the actual test-time scenario) are well-represented.
+    WIN_LENS = [4, 8, 16, 32, 64, 128, 256, 512]
+    WIN_WEIGHTS = np.array([0.10, 0.15, 0.20, 0.20, 0.15, 0.10, 0.07, 0.03])
+    WIN_WEIGHTS = WIN_WEIGHTS / WIN_WEIGHTS.sum()
+
+    print(f"[clf] streaming {domain} for {n_windows} variable-length windows...")
     stream = STREAMERS[domain]()
 
-    # Buffer tokens until we have enough for n_windows windows
-    needed = n_windows * WINDOW
+    # Buffer roughly enough text for the requested windows.
+    avg_window = int((np.array(WIN_LENS) * WIN_WEIGHTS).sum())
+    needed = n_windows * avg_window * 2  # 2x slack for sampling
     buf = []
     for text in stream:
         buf.extend(tok.encode(text, add_special_tokens=False))
         if len(buf) >= needed:
             break
-    if len(buf) < needed:
-        print(f"[clf]   warn: only got {len(buf)} tokens, wanted {needed}; "
-              f"using {len(buf)//WINDOW} windows")
-        n_windows = len(buf) // WINDOW
-        needed = n_windows * WINDOW
 
-    arr = np.array(buf[:needed], dtype=np.int64).reshape(n_windows, WINDOW)
-    # Clamp out-of-vocab (shouldn't happen with full Qwen vocab, defensive)
-    arr = np.clip(arr, 0, axes.shape[0] - 1)
-
-    # Lookup meaning vectors
-    meaning = axes[arr]  # (n_windows, WINDOW, 132)
-
-    # Per-window EMA: y_t = (1-α)·y_{t-1} + α·x_t.
-    decay = (1.0 - EMA_ALPHA)
-    weights = (EMA_ALPHA *
-               (decay ** np.arange(WINDOW - 1, -1, -1, dtype=np.float32)))
-    feat = (meaning * weights[None, :, None]).sum(axis=1)
-    return feat.astype(np.float32)
+    rng = np.random.default_rng(SEED + hash(domain) % 100)
+    feats = np.zeros((n_windows, 132), dtype=np.float32)
+    n_buf = len(buf)
+    for w in range(n_windows):
+        win_len = int(rng.choice(WIN_LENS, p=WIN_WEIGHTS))
+        if n_buf < win_len + 1:
+            continue
+        start = int(rng.integers(0, n_buf - win_len))
+        ids = np.clip(np.array(buf[start:start + win_len]),
+                      0, axes.shape[0] - 1)
+        meaning = axes[ids]  # (win_len, 132)
+        decay = (1.0 - EMA_ALPHA)
+        weights = (EMA_ALPHA *
+                   (decay ** np.arange(win_len - 1, -1, -1, dtype=np.float32)))
+        feats[w] = (meaning * weights[:, None]).sum(axis=0).astype(np.float32)
+    return feats
 
 
 class DomainMLP(nn.Module):
